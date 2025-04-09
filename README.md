@@ -1,4 +1,3 @@
-```markdown
 # 🏠 Парсер аренды недвижимости Krisha.kz + Telegram Bot
 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
@@ -43,8 +42,8 @@ await bot.send_message(
 
 ## 🚀 Установка
 ```bash
-git clone https://github.com/yourrepo/krisha-parser.git
-cd krisha-parser
+git clone https://github.com/NazirovJr/automate_realtor.git
+cd krisha.kz-main
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
