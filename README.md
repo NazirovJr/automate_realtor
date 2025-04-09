@@ -1,4 +1,4 @@
-# 🏠 Парсер аренды недвижимости Krisha.kz + Telegram Bot
+# 🏠 Парсер недвижимости Krisha.kz + Telegram Bot
 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
