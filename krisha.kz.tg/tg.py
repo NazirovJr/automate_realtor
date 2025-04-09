@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TOKEN = "7866153858:AAFMpL-XejNmlJdkgc9D6ExC1H6hkQeBPvY"
+TOKEN = "..."
 DATABASE_URL = "postgresql://postgres:postgres@localhost/krisha"
 
 # Инициализация базы данных
