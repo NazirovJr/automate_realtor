@@ -1,0 +1,10 @@
+__pycache__/
+.idea/
+.venv/
+.vscode/
+krisha.egg-info/
+logs/
+db.sqlite
+*.log
+_sql/
+.ruff_cache

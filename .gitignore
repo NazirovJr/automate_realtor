@@ -1,0 +1,86 @@
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+.idea/*.xml
+.idea/*.txt
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries/
+.idea/shelf/
+.idea/misc.xml
+.idea/inspectionProfiles/
+.idea/vcs.xml
+.idea/jsLibraryMappings.xml
+.idea/datasources.xml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+*.manifest
+*.spec
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+pythonenv*
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Local settings
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+.env.staging
+.env.*.local
+local_settings.py
+settings_local.py
+
+# Package managers
+pip-wheel-metadata/
+pip-delete-this-directory.txt
+
+# Editors
+.vscode/
+*.swp
+*.swo
+*~
