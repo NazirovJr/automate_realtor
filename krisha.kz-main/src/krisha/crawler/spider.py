@@ -124,9 +124,27 @@ def filter_ads_on_db_exists(connector: DBConnection, ads_url: list[str]) -> list
     for url in ads_url:
         try:
             flat_id = int(url.split("/")[-1])
-            if not check_flat_exists(connector, flat_id):
+            
+            # Check if the flat exists and get its latest price in one database query
+            query = """
+                SELECT p.price
+                FROM prices p
+                WHERE p.flat_id = %s
+                ORDER BY p.date DESC
+                LIMIT 1
+            """
+            
+            cursor = connector.connection.cursor()
+            cursor.execute(query, (flat_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if not result:
+                # Flat doesn't exist, add to parse list
                 filtered_ads_url.append(url)
-        except:
+                logger.debug(f"New listing found: {url}")
+        except Exception as e:
+            logger.error(f"Error checking flat existence: {e}")
             filtered_ads_url.append(url)
 
     return filtered_ads_url
@@ -136,24 +154,68 @@ def get_flats_data_on_page(
         ads_urls: list[str],
         config: Config,
         flat_parser: FlatParser,
+        connector: DBConnection
 ) -> list[Flat]:
     missed_ad_counter = 0
     flats_data = []
     for url in ads_urls:
         try:
-            response = get_response(url, config)
+            # Get flat ID from URL
+            flat_id = int(url.split("/")[-1])
+            
+            # First, get current price from API
             home_number = url.split('/')[-1]
-            priceAnalyze = get_response(PRICE_ANALYZE_URL + home_number, config)
-        except MaximumRetryRequestsError as error:
+            try:
+                priceAnalyze = get_response(PRICE_ANALYZE_URL + home_number, config)
+                response = get_response(url, config)
+                content = get_content(response)
+                
+                # Check price before fully parsing
+                price_element = content.select_one(".offer__price")
+                if price_element:
+                    current_price_text = price_element.get_text(strip=True)
+                    current_price = int(''.join(filter(str.isdigit, current_price_text)))
+                    
+                    # Query DB for existing price
+                    query = """
+                        SELECT p.price
+                        FROM prices p
+                        WHERE p.flat_id = %s
+                        ORDER BY p.date DESC
+                        LIMIT 1
+                    """
+                    
+                    cursor = connector.connection.cursor()
+                    cursor.execute(query, (flat_id,))
+                    result = cursor.fetchone()
+                    cursor.close()
+                    
+                    if result and result[0] == current_price:
+                        # Price hasn't changed, skip this listing
+                        logger.info(f"Skipping listing {url} - price unchanged: {current_price}")
+                        continue
+                    
+                    # Price has changed or new listing, proceed with parsing
+                    greenPercentage = extract_price_percent_diff(priceAnalyze.text)
+                    flat = flat_parser.get_flat(content, url, greenPercentage)
+                    flats_data.append(flat)
+                    logger.debug(f"Parsed listing {url} - price: {current_price}")
+                else:
+                    # If we can't determine the price from the page, parse it anyway
+                    greenPercentage = extract_price_percent_diff(priceAnalyze.text)
+                    flat = flat_parser.get_flat(content, url, greenPercentage)
+                    flats_data.append(flat)
+                
+            except MaximumRetryRequestsError as error:
+                missed_ad_counter += 1
+                if missed_ad_counter > config.parser_config.max_skip_ad:
+                    raise MaximumMissedAdError from error
+                logger.warning(msg.CR_SKIP_AD)
+        except Exception as e:
+            logger.error(f"Error processing URL {url}: {e}")
             missed_ad_counter += 1
             if missed_ad_counter > config.parser_config.max_skip_ad:
-                raise MaximumMissedAdError from error
-            logger.warning(msg.CR_SKIP_AD)
-        else:
-            content = get_content(response)
-            greenPercentage = extract_price_percent_diff(priceAnalyze.text)
-            flats_data.append(flat_parser.get_flat(content, url, greenPercentage))
-            logger.debug(msg.CR_FLAT_DATA_OK)
+                raise MaximumMissedAdError from e
 
         sleep(config.parser_config.sleep_time)
 
@@ -187,10 +249,22 @@ def run_crawler(config: Config, connector: DBConnection, url: str) -> None:
             filtered_ads_url = filter_ads_on_db_exists(connector, ads_urls)
 
             if len(filtered_ads_url) == 0:
+                logger.info(f"Page {num}/{page_count}: No new listings to process")
+                if num < page_count:
+                    next_url = get_next_url(config.parser_config.home_url, content)
+                    response = get_response(next_url, config)
+                    content = get_content(response)
                 continue
 
-            flats_data = get_flats_data_on_page(filtered_ads_url, config, flat_parser)
-            insert_flats_data_db(connector, flats_data)
+            logger.info(f"Page {num}/{page_count}: Found {len(filtered_ads_url)} new or updated listings")
+            flats_data = get_flats_data_on_page(filtered_ads_url, config, flat_parser, connector)
+            
+            if flats_data:
+                insert_flats_data_db(connector, flats_data)
+                logger.info(f"Page {num}/{page_count}: Inserted {len(flats_data)} listings")
+            else:
+                logger.info(f"Page {num}/{page_count}: No listings to insert after price check")
+                
             logger.info(msg.CR_PROCESS.format(num, page_count))
 
             sleep(config.parser_config.sleep_time)

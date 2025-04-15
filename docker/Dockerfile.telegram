@@ -1,0 +1,29 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install PostgreSQL client for database connection
+RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY krisha.kz.tg/requirements.txt ./requirements.txt
+
+# Install dependencies
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# Copy the Telegram bot code
+COPY krisha.kz.tg/tg.py ./tg.py
+
+# Copy the .env file
+COPY krisha.kz.tg/.env ./.env
+
+# Copy migration scripts
+COPY migrations /app/migrations
+
+# Add database migration script
+COPY docker/run_telegram.sh /run_telegram.sh
+RUN chmod +x /run_telegram.sh
+
+# Set entry point
+CMD ["/run_telegram.sh"] 

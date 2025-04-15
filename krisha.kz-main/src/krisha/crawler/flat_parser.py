@@ -66,7 +66,6 @@ class FlatParser:
         address = cls._get_sub_data(adverts, "fullAddress")
         title = cls._get_sub_data(adverts, "title")
         lat_lon = cls._get_sub_data(advert, "map")
-        photos = cls._get_sub_data(advert, "photos")
 
         return Flat(
             id=cls._get_sub_data(advert, "id", required=True),
@@ -78,7 +77,6 @@ class FlatParser:
             lat=cls._get_sub_data(lat_lon, "lat") if lat_lon else None,
             lon=cls._get_sub_data(lat_lon, "lon") if lat_lon else None,
             description=cls._get_sub_data(adverts, "description"),
-            photo=cls._get_sub_data(photos[0], "src") if photos else None,
             price=cls._get_sub_data(advert, "price", required=True),
             green_percentage=green_percentage,
             address = address,

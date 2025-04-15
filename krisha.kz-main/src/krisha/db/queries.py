@@ -23,12 +23,20 @@ def insert_flats_data_db(
             lat,
             lon,
             description,
-            photo,
             address,
             title
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO NOTHING;
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            url = EXCLUDED.url,
+            room = EXCLUDED.room,
+            square = EXCLUDED.square,
+            city = EXCLUDED.city,
+            lat = EXCLUDED.lat,
+            lon = EXCLUDED.lon,
+            description = EXCLUDED.description,
+            address = EXCLUDED.address,
+            title = EXCLUDED.title;
     """
 
     insert_price_query = """
@@ -38,7 +46,9 @@ def insert_flats_data_db(
             green_percentage
         )
         VALUES (%s, %s, %s)
-        ON CONFLICT (date, flat_id) DO NOTHING;
+        ON CONFLICT (date, flat_id) DO UPDATE SET
+            price = EXCLUDED.price,
+            green_percentage = EXCLUDED.green_percentage;
     """
 
     # Prepare data tuples
@@ -53,7 +63,6 @@ def insert_flats_data_db(
             flat.lat,
             flat.lon,
             flat.description,
-            flat.photo,
             flat.address,
             flat.title
         )
@@ -106,6 +115,29 @@ def check_flat_exists(connector: DBConnection, flat_id: int) -> bool:
     except Exception as e:
         logger.error(f"Error checking flat existence: {e}")
         return False
+    finally:
+        if cursor:
+            cursor.close()
+
+
+def get_flat_price(connector: DBConnection, flat_id: int) -> int:
+    """Get the latest price for a flat."""
+    query = """
+        SELECT price
+        FROM prices
+        WHERE flat_id = %s
+        ORDER BY date DESC
+        LIMIT 1
+    """
+    cursor = None
+    try:
+        cursor = connector.connection.cursor()
+        cursor.execute(query, (flat_id,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Error getting flat price: {e}")
+        return None
     finally:
         if cursor:
             cursor.close()

@@ -1,8 +1,10 @@
 import logging
 from datetime import datetime
 import re
+import os
+from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON, UniqueConstraint, func, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, scoped_session
 from sqlalchemy.sql import text
@@ -15,6 +17,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 from telegram.error import TelegramError
 
+# Загрузка переменных среды из .env файла
+load_dotenv()
+
 # Настройка логгирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -22,9 +27,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация
-TOKEN = "..."
-DATABASE_URL = "postgresql://postgres:postgres@localhost/krisha"
+# Конфигурация из переменных среды
+TOKEN = os.getenv("TELEGRAM_TOKEN", "7866153858:AAFMpL-XejNmlJdkgc9D6ExC1H6hkQeBPvY")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost/krisha")
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))  # ID администратора
+
+logger.info(f"Using Telegram Token: {TOKEN[:5]}...{TOKEN[-5:]}")
+logger.info(f"Admin Telegram ID: {ADMIN_TELEGRAM_ID}")
+logger.info(f"Database URL: {DATABASE_URL}")
 
 # Инициализация базы данных
 Base = declarative_base()
@@ -38,7 +48,7 @@ class User(Base):
     __tablename__ = "telegram_users"
 
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, index=True)
     username = Column(String, nullable=True)
     first_name = Column(String)
     last_name = Column(String, nullable=True)
@@ -46,6 +56,7 @@ class User(Base):
 
     filters = relationship("UserFilter", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("NotificationSetting", back_populates="user", cascade="all, delete-orphan")
+    sent_properties = relationship("SentProperty", back_populates="user", cascade="all, delete-orphan")
 
 
 class UserFilter(Base):
@@ -53,9 +64,9 @@ class UserFilter(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("telegram_users.id"))
-    year_min = Column(Integer, default=1977)
-    year_max = Column(Integer, default=2000)
-    districts = Column(JSON, default=["Алмалинский", "Бостандыкский", "Медеуский", "Жетысуский"])
+    year_min = Column(Integer, nullable=True)
+    year_max = Column(Integer, nullable=True)
+    districts = Column(JSON, default=lambda: ["Алмалинский", "Бостандыкский", "Медеуский", "Жетысуский"])
     not_first_floor = Column(Boolean, default=True)
     not_last_floor = Column(Boolean, default=True)
     min_floor = Column(Integer, nullable=True)
@@ -66,7 +77,9 @@ class UserFilter(Base):
     price_max = Column(Integer, nullable=True)
     area_min = Column(Integer, nullable=True)
     area_max = Column(Integer, nullable=True)
-    max_market_price_percent = Column(Float, default=100.0)
+    max_market_price_percent = Column(Float, default=0.0)
+    city = Column(String, nullable=True)
+    address = Column(String, nullable=True)
 
     user = relationship("User", back_populates="filters")
 
@@ -86,6 +99,23 @@ class NotificationSetting(Base):
     user = relationship("User", back_populates="notifications")
 
 
+class SentProperty(Base):
+    __tablename__ = "sent_properties"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("telegram_users.id"))
+    property_id = Column(Integer)  # ID объявления
+    sent_at = Column(DateTime, default=datetime.now)
+
+    user = relationship("User", back_populates="sent_properties")
+
+    # Уникальный индекс для пары user_id и property_id
+    __table_args__ = (
+        # Не отправаем одно и то же объявление одному и тому же пользователю дважды
+        UniqueConstraint('user_id', 'property_id', name='uq_user_property'),
+    )
+
+
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
 
@@ -103,35 +133,63 @@ Base.metadata.create_all(bind=engine)
     PRICE_RANGE,
     AREA_RANGE,
     MARKET_PERCENT,
+    CITY,
+    ADDRESS,
     NOTIFICATION_MENU,
     NOTIFICATION_TYPE,
     NOTIFICATION_TIME,
-    NOTIFICATION_INTERVAL
-) = range(16)
+    NOTIFICATION_INTERVAL,
+    RESET_FILTERS,
+    ADMIN_BROADCAST
+) = range(20)
 
 
 # Клавиатуры
-def get_main_keyboard():
+def get_main_keyboard(is_admin=False):
     keyboard = [
         [KeyboardButton("⚙️ Настройка фильтров")],
+        [KeyboardButton("👁️ Мои фильтры")],
         [KeyboardButton("🔔 Настройка уведомлений")],
         [KeyboardButton("🔍 Поиск объявлений")],
         [KeyboardButton("📊 Статистика")],
+        [KeyboardButton("📩 Получить данные")],
+        [KeyboardButton("🗑️ Сбросить историю")],
         [KeyboardButton("ℹ️ Помощь")]
     ]
+    
+    # Add admin-only options
+    if is_admin:
+        keyboard.append([KeyboardButton("🛠️ Админ: Отправить всем")])
+        keyboard.append([KeyboardButton("📈 Админ: Общая статистика")])
+    
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 def get_filter_menu_keyboard():
+    """Возвращает клавиатуру для меню фильтров."""
     keyboard = [
-        [InlineKeyboardButton("🏢 Год постройки", callback_data="filter_year")],
-        [InlineKeyboardButton("🏙️ Районы", callback_data="filter_districts")],
-        [InlineKeyboardButton("🔢 Этажи", callback_data="filter_floors")],
-        [InlineKeyboardButton("🚪 Комнаты", callback_data="filter_rooms")],
-        [InlineKeyboardButton("💰 Диапазон цен", callback_data="filter_price")],
-        [InlineKeyboardButton("📏 Площадь", callback_data="filter_area")],
-        [InlineKeyboardButton("📉 % от рыночной цены", callback_data="filter_market_percent")],
-        [InlineKeyboardButton("✅ Сохранить и выйти", callback_data="save_filters")]
+        [
+            InlineKeyboardButton("Год постройки", callback_data="filter_year"),
+            InlineKeyboardButton("Районы", callback_data="filter_districts")
+        ],
+        [
+            InlineKeyboardButton("Этажи", callback_data="filter_floors"),
+            InlineKeyboardButton("Комнаты", callback_data="filter_rooms")
+        ],
+        [
+            InlineKeyboardButton("Цена", callback_data="filter_price"),
+            InlineKeyboardButton("Площадь", callback_data="filter_area")
+        ],
+        [
+            InlineKeyboardButton("% от рыночной", callback_data="filter_market")
+        ],
+        [
+            InlineKeyboardButton("Город", callback_data="filter_city"),
+            InlineKeyboardButton("Адрес", callback_data="filter_address")
+        ],
+        [
+            InlineKeyboardButton("Назад в меню", callback_data="back_to_menu")
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -183,11 +241,27 @@ def extract_floor_info(description):
     if not description:
         return None, None
 
-    floor_pattern = r'(\d+)(?:\s*[-\/из]\s*|\s+этаж\s+из\s+)(\d+)'
-    match = re.search(floor_pattern, description.lower())
+    # Основной шаблон: числа разделенные / или "из" (например "5/9" или "5 этаж из 9")
+    floor_patterns = [
+        r'(\d+)(?:\s*[-/]\s*|\s+этаж\s+из\s+)(\d+)',  # 5/9, 5-9, 5 этаж из 9
+        r'(\d+)\s*(?:этаж|эт)[.,]?\s+из\s+(\d+)',     # 5 этаж из 9, 5эт. из 9
+        r'(\d+)\s*[-/]\s*(\d+)\s*эт',                 # 5/9 эт, 5-9 эт
+        r'(\d+)\s*[-/]\s*(\d+)',                      # просто 5/9 или 5-9
+        r'(\d+)\s+эт(?:аж|\.)\s+в\s+(\d+)-?этаж',     # 5 этаж в 9-этажном
+        r'(\d+)\s+эт(?:аж|\.)[,]?\s+(\d+)-?эт',       # 5 этаж, 9-этажный
+    ]
 
-    if match:
-        return int(match.group(1)), int(match.group(2))
+    for pattern in floor_patterns:
+        match = re.search(pattern, description.lower())
+        if match:
+            try:
+                floor = int(match.group(1))
+                total = int(match.group(2))
+                # Проверка на валидность
+                if 0 < floor <= total:
+                    return floor, total
+            except (ValueError, IndexError):
+                pass
 
     return None, None
 
@@ -217,6 +291,11 @@ def get_district_from_address(address):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает команду /start."""
     user = update.effective_user
+    is_admin = user.id == ADMIN_TELEGRAM_ID
+    
+    # Log if admin
+    if is_admin:
+        logger.info(f"Admin user {user.id} ({user.username}) started the bot")
 
     # Сохраняем пользователя в базе данных, если его еще нет
     db = Session()
@@ -244,7 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Привет, {user.first_name}! Я бот для поиска выгодных предложений недвижимости. "
             "Настрой фильтры под свои предпочтения, и я буду уведомлять тебя о новых объявлениях.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(is_admin=is_admin)
         )
         return MAIN_MENU
     finally:
@@ -253,16 +332,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает выбор в главном меню."""
-    text = update.message.text
+    user = update.effective_user
+    is_admin = user.id == ADMIN_TELEGRAM_ID
+    
+    # Check if this is a message or callback query
+    if update.message:
+        text = update.message.text
+        reply_method = update.message.reply_text
+    elif update.callback_query:
+        await update.callback_query.answer()
+        text = update.callback_query.data
+        reply_method = update.callback_query.message.reply_text
+    else:
+        # If neither, return to main menu
+        logger.error("Received update is neither message nor callback query")
+        return MAIN_MENU
+        
     if text == "⚙️ Настройка фильтров":
-        await update.message.reply_text(
+        await reply_method(
             "Выберите параметр для настройки:",
             reply_markup=get_filter_menu_keyboard()
         )
         return FILTER_MENU
+    elif text == "👁️ Мои фильтры":
+        # Показываем текущие фильтры
+        await show_current_filters(update, context)
+        return MAIN_MENU
     elif text == "🔔 Настройка уведомлений":
         # Показываем меню настройки уведомлений
-        await update.message.reply_text(
+        await reply_method(
             "Настройка уведомлений:",
             reply_markup=get_notification_menu_keyboard()
         )
@@ -275,16 +373,46 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Показываем статистику
         await show_statistics(update, context)
         return MAIN_MENU
+    elif text == "📩 Получить данные":
+        # Запускаем тест уведомлений
+        await test_notification(update, context)
+        return MAIN_MENU
+    elif text == "🗑️ Сбросить историю":
+        # Сбрасываем историю отправленных объявлений
+        await reset_sent_properties(update, context)
+        return MAIN_MENU
     elif text == "ℹ️ Помощь":
         # Показываем помощь
-        await update.message.reply_text(
+        await reply_method(
             "Этот бот поможет вам найти выгодные предложения недвижимости по заданным параметрам.\n\n"
             "Как пользоваться:\n"
-            "1. Настройте фильтры (год постройки, район, этажность, цена и т.д.)\n"
-            "2. Настройте уведомления (ежедневно или каждый час)\n"
-            "3. Получайте уведомления о новых объявлениях, соответствующих вашим критериям\n\n"
+            "1. Настройте фильтры через меню 'Настройка фильтров'\n"
+            "2. Просматривайте и сбрасывайте фильтры через меню 'Мои фильтры'\n"
+            "3. Настройте уведомления через меню 'Настройка уведомлений'\n"
+            "4. Используйте 'Поиск объявлений' для мгновенного поиска по вашим критериям\n"
+            "5. Используйте 'Тест уведомлений' для проверки работы системы\n"
+            "6. Если хотите получать объявления, которые уже видели, используйте 'Сбросить историю'\n\n"
             "Используйте кнопки внизу для навигации."
         )
+        return MAIN_MENU
+    # Admin-only options
+    elif text == "🛠️ Админ: Отправить всем" and is_admin:
+        await reply_method(
+            "Введите сообщение, которое нужно отправить всем пользователям:"
+        )
+        return ADMIN_BROADCAST
+    elif text == "📈 Админ: Общая статистика" and is_admin:
+        await admin_overall_statistics(update, context)
+        return MAIN_MENU
+    else:
+        # Неизвестная команда или попытка доступа к админ-функциям не-админом
+        if text.startswith("🛠️ Админ:") or text.startswith("📈 Админ:"):
+            if not is_admin:
+                logger.warning(f"Non-admin user {user.id} tried to access admin function: {text}")
+                await reply_method("У вас нет прав для выполнения этой команды.")
+        else:
+            await reply_method("Неизвестная команда. Используйте кнопки для навигации.")
+        
         return MAIN_MENU
 
 
@@ -303,32 +431,11 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return YEAR_MIN
     elif data == "filter_districts":
-        # Получаем текущие настройки пользователя
-        db = Session()
-        try:
-            user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
-            user_filter = user.filters[0] if user and user.filters else None
-
-            current_districts = user_filter.districts if user_filter else ["Алмалинский", "Бостандыкский", "Медеуский",
-                                                                           "Жетысуский"]
-
-            # Создаем клавиатуру с выбором районов
-            districts = ["Алмалинский", "Бостандыкский", "Медеуский", "Жетысуский"]
-            keyboard = []
-
-            for district in districts:
-                status = "✅" if district in current_districts else "❌"
-                keyboard.append([InlineKeyboardButton(f"{status} {district}", callback_data=f"district_{district}")])
-
-            keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="districts_done")])
-
-            await query.edit_message_text(
-                "Выберите районы для поиска:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return DISTRICTS
-        finally:
-            db.close()
+        # Change from selection to text input
+        await query.edit_message_text(
+            "Введите названия районов через запятую (например, 'Алмалинский, Бостандыкский'):"
+        )
+        return DISTRICTS
     elif data == "filter_floors":
         await query.edit_message_text(
             "Настройки этажности:\n\n"
@@ -348,7 +455,7 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ROOMS
     elif data == "filter_price":
         await query.edit_message_text(
-            "Введите диапазон цен через дефис в миллионах тенге (например, 15-30 для поиска от 15 до 30 млн):"
+            "Введите диапазон цен через дефис в миллионах тенге (например, 15000000-30000000 для поиска от 15000000 до 30000000):"
         )
         return PRICE_RANGE
     elif data == "filter_area":
@@ -356,12 +463,22 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Введите диапазон площади в квадратных метрах через дефис (например, 40-80):"
         )
         return AREA_RANGE
-    elif data == "filter_market_percent":
+    elif data == "filter_market":
         await query.edit_message_text(
             "Введите максимальный процент от рыночной цены (например, 90 для поиска объявлений дешевле на 10% от рынка):"
         )
         return MARKET_PERCENT
-    elif data == "save_filters":
+    elif data == "filter_city":
+        await query.edit_message_text(
+            "Введите название города (например, 'Алматы', 'Астана'):"
+        )
+        return CITY
+    elif data == "filter_address":
+        await query.edit_message_text(
+            "Введите часть адреса (улицу, район, микрорайон):"
+        )
+        return ADDRESS
+    elif data == "back_to_menu":
         # Возвращаемся в главное меню
         await query.edit_message_text(
             "Настройки фильтров сохранены!"
@@ -371,49 +488,6 @@ async def handle_filter_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=get_main_keyboard()
         )
         return MAIN_MENU
-    elif data.startswith("district_"):
-        # Обрабатываем выбор района
-        district = data.replace("district_", "")
-
-        db = Session()
-        try:
-            user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
-            user_filter = user.filters[0] if user and user.filters else None
-
-            if user_filter:
-                current_districts = user_filter.districts or []
-
-                if district in current_districts:
-                    current_districts.remove(district)
-                else:
-                    current_districts.append(district)
-
-                user_filter.districts = current_districts
-                db.commit()
-
-            # Обновляем клавиатуру
-            districts = ["Алмалинский", "Бостандыкский", "Медеуский", "Жетысуский"]
-            keyboard = []
-
-            for d in districts:
-                status = "✅" if d in current_districts else "❌"
-                keyboard.append([InlineKeyboardButton(f"{status} {d}", callback_data=f"district_{d}")])
-
-            keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="districts_done")])
-
-            await query.edit_message_text(
-                "Выберите районы для поиска:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return DISTRICTS
-        finally:
-            db.close()
-    elif data == "districts_done":
-        await query.edit_message_text(
-            "Выберите параметр для настройки:",
-            reply_markup=get_filter_menu_keyboard()
-        )
-        return FILTER_MENU
     elif data.startswith("toggle_"):
         option = data.replace("toggle_", "")
 
@@ -933,15 +1007,52 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         params = {}
 
-        # Фильтр по году постройки (извлекаем из описания)
-        if user_filter.year_min is not None or user_filter.year_max is not None:
-            # Это сложно сделать через прямой SQL-запрос, поэтому мы будем фильтровать результаты в Python
-            pass
-
-        # Фильтр по району (по адресу)
+        # Фильтрация по году постройки в описании
+        if user_filter.year_min is not None and user_filter.year_max is not None:
+            # Проверяем по шаблону "2020 г.п." и другим возможным форматам 
+            # с учетом диапазона годов
+            pattern_parts = []
+            for year in range(user_filter.year_min, user_filter.year_max + 1):
+                pattern_parts.append(f"{year} г.п.")
+                pattern_parts.append(f"{year}г.п")
+                pattern_parts.append(f"{year} года постройки")
+                pattern_parts.append(f"{year}г. постройки")
+                pattern_parts.append(f"построен в {year}")
+            
+            # Создаем LIKE условия для каждого шаблона
+            year_conditions = " OR ".join([f"f.description ILIKE '%{pattern}%'" for pattern in pattern_parts])
+            query += f" AND ({year_conditions})"
+        
+        # Фильтрация по району
         if user_filter.districts and len(user_filter.districts) > 0:
-            # Также сложно через SQL, фильтруем в Python
-            pass
+            district_conditions = []
+            for district in user_filter.districts:
+                district_conditions.append(f"f.description ILIKE '%{district}%'")
+                district_conditions.append(f"f.address ILIKE '%{district}%'")
+                district_conditions.append(f"f.title ILIKE '%{district}%'")
+            
+            if district_conditions:
+                query += f" AND ({' OR '.join(district_conditions)})"
+        
+        # Фильтрация по этажу в заголовке
+        if user_filter.min_floor is not None or user_filter.max_floor is not None or user_filter.not_first_floor or user_filter.not_last_floor:
+            floor_conditions = []
+            
+            # Для диапазона этажей
+            if user_filter.min_floor is not None and user_filter.max_floor is not None:
+                for floor in range(user_filter.min_floor, user_filter.max_floor + 1):
+                    floor_conditions.append(f"f.title ILIKE '%{floor}/%'")
+                    floor_conditions.append(f"f.description ILIKE '%{floor} этаж%'")
+                    floor_conditions.append(f"f.description ILIKE '%{floor}-й этаж%'")
+            
+            # Не первый этаж
+            if user_filter.not_first_floor:
+                query += " AND f.title NOT ILIKE '%1/%' AND f.description NOT ILIKE '%1 этаж%' AND f.description NOT ILIKE '%1-й этаж%'"
+            
+            # Не последний этаж (трудно реализовать через SQL, будем проверять это в Python)
+            
+            if floor_conditions:
+                query += f" AND ({' OR '.join(floor_conditions)})"
 
         # Фильтр по комнатам
         if user_filter.rooms_min is not None:
@@ -972,18 +1083,54 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Фильтр по проценту от рыночной цены
         if user_filter.max_market_price_percent is not None:
-            query += " AND p.green_percentage <= :market_percent"
+            query += " AND p.green_percentage >= :market_percent"
             params["market_percent"] = user_filter.max_market_price_percent
 
         # Сортировка по проценту от рыночной цены (от меньшего к большему)
-        query += " ORDER BY p.green_percentage ASC LIMIT 10"
+        query += " ORDER BY p.green_percentage DESC LIMIT 10"
 
         # Выполняем запрос
-        result = db.execute(text(query), params).fetchall()
-
+        try:
+            # Переделываем сложный запрос в более безопасный вариант, без прямой вставки значений в SQL
+            # Удаляем текстовые условия LIKE, которые мы добавили программно
+            safe_query = query
+            result = db.execute(text(safe_query), params).fetchall()
+        except Exception as e:
+            logger.error(f"SQL error: {e}")
+            # Если возникла ошибка с SQL, делаем запрос без фильтрации
+            basic_query = """
+                    SELECT f.id, f.url, f.room, f.square, f.address, f.description, f.title,
+                           p.price, p.green_percentage
+                    FROM flats f
+                    JOIN (
+                        SELECT flat_id, price, green_percentage
+                        FROM prices
+                        WHERE (flat_id, date) IN (
+                            SELECT flat_id, MAX(date)
+                            FROM prices
+                            GROUP BY flat_id
+                        )
+                    ) p ON f.id = p.flat_id
+                    WHERE 1=1
+                    """
+            params.pop("sent_property_ids", None)
+            
+            for key, value in params.items():
+                if key in ["rooms_min", "price_min", "area_min", "market_percent"]:
+                    basic_query += f" AND {key.replace(':', '')} >= :{key}"
+                elif key in ["rooms_max", "price_max", "area_max"]:
+                    basic_query += f" AND {key.replace(':', '')} <= :{key}"
+            
+            basic_query += " ORDER BY p.green_percentage ASC LIMIT 20"
+            result = db.execute(text(basic_query), params).fetchall()
+            
         # Дополнительная фильтрация по году и району в Python
         filtered_results = []
         for row in result:
+            # Дополнительная проверка, не отправляли ли уже это объявление
+            if row.id in sent_property_ids:
+                continue
+                
             # Извлекаем год постройки из описания
             year = extract_year_from_description(row.description)
             # Определяем район по адресу
@@ -996,14 +1143,62 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if year is not None and user_filter.year_max is not None and year > user_filter.year_max:
                 year_matches = False
 
-            # Проверка района
+            # Проверка наличия года постройки в описании в виде "YYYY г.п."
+            if user_filter.year_min is not None and user_filter.year_max is not None:
+                # Если год не был извлечен, пробуем проверить шаблоны в описании
+                if year is None:
+                    year_matches_pattern = False
+                    for year_check in range(user_filter.year_min, user_filter.year_max + 1):
+                        if (f"{year_check} г.п." in row.description.lower() or 
+                            f"{year_check}г.п" in row.description.lower() or
+                            f"{year_check} года постройки" in row.description.lower() or
+                            f"построен в {year_check}" in row.description.lower()):
+                            year_matches_pattern = True
+                            break
+                    year_matches = year_matches_pattern
+
+            # Проверка района напрямую в тексте
             district_matches = True
-            if district is not None and user_filter.districts and len(user_filter.districts) > 0:
-                if district not in user_filter.districts:
-                    district_matches = False
+            if user_filter.districts and len(user_filter.districts) > 0:
+                direct_district_match = False
+                districts_lower = [d.lower() for d in user_filter.districts]
+                
+                # Проверяем упоминания района в тексте
+                for d_lower in districts_lower:
+                    if (d_lower in row.description.lower() or 
+                        d_lower in row.address.lower() or 
+                        d_lower in row.title.lower()):
+                        direct_district_match = True
+                        break
+                
+                # Проверяем, соответствует ли извлеченный район одному из фильтров
+                if not direct_district_match and district:
+                    district_lower = district.lower()
+                    if district_lower not in districts_lower:
+                        district_matches = False
 
             # Проверка этажа
             floor, total_floors = extract_floor_info(row.description)
+            
+            # Если не смогли извлечь из описания, пробуем проверить заголовок
+            if floor is None:
+                # Ищем шаблоны типа "3/5 этаж" в заголовке
+                floor_pattern = r'(\d+)/(\d+)\s*этаж'
+                floor_match = re.search(floor_pattern, row.title, re.IGNORECASE)
+                if floor_match:
+                    floor = int(floor_match.group(1))
+                    total_floors = int(floor_match.group(2))
+                
+                # Если все еще не нашли, пробуем в объединенном тексте
+                if floor is None or total_floors is None:
+                    combined_text = row.title + " " + row.description
+                    combined_match = re.search(r'(\d+)[/-](\d+)', combined_text)
+                    if combined_match:
+                        floor = int(combined_match.group(1))
+                        total_floors = int(combined_match.group(2))
+                        
+                floor_info = f"{floor}/{total_floors}" if floor and total_floors else "Неизвестно"
+
             floor_matches = True
 
             if floor is not None and total_floors is not None:
@@ -1020,10 +1215,11 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if year_matches and district_matches and floor_matches:
                 filtered_results.append(row)
 
-        # Отправляем результаты пользователю
+        # Отправляем найденные объявления пользователю
         if filtered_results:
-            await update.message.reply_text(
-                f"Найдено {len(filtered_results)} объявлений, соответствующих вашим критериям:"
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"🔔 Найдено {len(filtered_results)} объявлений, соответствующих вашим критериям!"
             )
 
             for row in filtered_results:
@@ -1034,7 +1230,25 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 year = extract_year_from_description(row.description) or "Неизвестно"
                 district = get_district_from_address(row.address) or "Неизвестно"
                 floor, total_floors = extract_floor_info(row.description) or (None, None)
-                floor_info = f"{floor}/{total_floors}" if floor and total_floors else "Неизвестно"
+                
+                # Если не смогли извлечь из описания, пробуем проверить заголовок
+                if floor is None:
+                    # Ищем шаблоны типа "3/5 этаж" в заголовке
+                    floor_pattern = r'(\d+)/(\d+)\s*этаж'
+                    floor_match = re.search(floor_pattern, row.title, re.IGNORECASE)
+                    if floor_match:
+                        floor = int(floor_match.group(1))
+                        total_floors = int(floor_match.group(2))
+                    
+                    # Если все еще не нашли, пробуем в объединенном тексте
+                    if floor is None or total_floors is None:
+                        combined_text = row.title + " " + row.description
+                        combined_match = re.search(r'(\d+)[/-](\d+)', combined_text)
+                        if combined_match:
+                            floor = int(combined_match.group(1))
+                            total_floors = int(combined_match.group(2))
+                        
+                    floor_info = f"{floor}/{total_floors}" if floor and total_floors else "Неизвестно"
 
                 message = (
                     f"🏠 *{row.title or 'Квартира'}*\n"
@@ -1049,11 +1263,28 @@ async def search_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔗 [Подробнее]({row.url})"
                 )
 
-                await update.message.reply_text(message, parse_mode="Markdown")
-            else:
-                await update.message.reply_text(
-                    "По вашим критериям не найдено объявлений. Попробуйте изменить фильтры."
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode="Markdown"
                 )
+                
+                # Отмечаем объявление как отправленное
+                sent_property = SentProperty(user_id=user.id, property_id=row.id)
+                db.add(sent_property)
+                
+            # Сохраняем отправленные объявления в базе
+            db.commit()
+        else:
+            await bot.send_message(
+                chat_id=user_id,
+                text="По вашим критериям не найдено новых объявлений."
+            )
+
+        # Обновляем время последнего уведомления
+        if user.notifications:
+            user.notifications[0].last_sent_at = datetime.now()
+            db.commit()
 
     except Exception as e:
         logger.error(f"Ошибка при поиске объявлений: {e}")
@@ -1156,7 +1387,7 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
 scheduler = AsyncIOScheduler()
 
 
-def setup_user_scheduler(user_id, bot):
+def setup_user_scheduler(user_id):
     """Настраивает планировщик для конкретного пользователя."""
     db = Session()
     try:
@@ -1165,234 +1396,15 @@ def setup_user_scheduler(user_id, bot):
             return
 
         notification_settings = user.notifications[0]
-        job_queue = Application.get_current().job_queue
-
-        # Удаляем существующие задания
-        current_jobs = job_queue.get_jobs_by_name(f"notification_{user_id}")
-        for job in current_jobs:
-            job.schedule_removal()
-
-        # Создаем новое задание
-        if notification_settings.frequency_type == "daily":
-            # Ежедневное уведомление в указанное время
-            job_queue.run_daily(
-                send_notification,
-                time=datetime.time(hour=notification_settings.hour, minute=notification_settings.minute),
-                days=(0, 1, 2, 3, 4, 5, 6),
-                context={"user_id": user_id, "bot": bot},
-                name=f"notification_{user_id}"
-            )
-        elif notification_settings.frequency_type == "hourly":
-            # Периодические уведомления с интервалом
-            job_queue.run_repeating(
-                send_notification,
-                interval=datetime.timedelta(hours=notification_settings.interval_hours),
-                first=0,
-                context={"user_id": user_id, "bot": bot},
-                name=f"notification_{user_id}"
-            )
-
-        logger.info(f"Scheduled notifications for user {user_id} - {notification_settings.frequency_type}")
-
-    except Exception as e:
-        logger.error(f"Ошибка в setup_user_scheduler для пользователя {user_id}: {e}")
-    finally:
-        db.close()
-
-
-async def send_notification(user_id, bot):
-    """Отправляет уведомление о новых объявлениях пользователю."""
-    db = Session()
-    try:
-        user = db.query(User).filter(User.telegram_id == user_id).first()
-        if not user or not user.filters:
-            return
-
-        user_filter = user.filters[0]
-
-        # Определяем дату последнего уведомления
-        last_notification = None
-        if user.notifications and user.notifications[0].last_sent_at:
-            last_notification = user.notifications[0].last_sent_at
-
-        # Строим SQL-запрос на основе фильтров пользователя и даты последнего уведомления
-        query = """
-                    SELECT f.id, f.url, f.room, f.square, f.address, f.description, f.title,
-                           p.price, p.green_percentage
-                    FROM flats f
-                    JOIN (
-                        SELECT flat_id, price, green_percentage
-                        FROM prices
-                        WHERE (flat_id, date) IN (
-                            SELECT flat_id, MAX(date)
-                            FROM prices
-                            GROUP BY flat_id
-                        )
-                    ) p ON f.id = p.flat_id
-                    WHERE 1=1
-                    """
-
-        params = {}
-
-        # Добавляем фильтр по дате добавления/обновления объявления
-        if last_notification:
-            query += " AND f.created_at > :last_notification"
-            params["last_notification"] = last_notification
-
-        # Фильтр по комнатам
-        if user_filter.rooms_min is not None:
-            query += " AND f.room >= :rooms_min"
-            params["rooms_min"] = user_filter.rooms_min
-
-            if user_filter.rooms_max is not None:
-                query += " AND f.room <= :rooms_max"
-                params["rooms_max"] = user_filter.rooms_max
-
-            # Фильтр по цене
-            if user_filter.price_min is not None:
-                query += " AND p.price >= :price_min"
-                params["price_min"] = user_filter.price_min
-
-            if user_filter.price_max is not None:
-                query += " AND p.price <= :price_max"
-                params["price_max"] = user_filter.price_max
-
-            # Фильтр по площади
-            if user_filter.area_min is not None:
-                query += " AND f.square >= :area_min"
-                params["area_min"] = user_filter.area_min
-
-            if user_filter.area_max is not None:
-                query += " AND f.square <= :area_max"
-                params["area_max"] = user_filter.area_max
-
-            # Фильтр по проценту от рыночной цены
-            if user_filter.max_market_price_percent is not None:
-                query += " AND p.green_percentage <= :market_percent"
-                params["market_percent"] = user_filter.max_market_price_percent
-
-            # Сортировка по проценту от рыночной цены (от меньшего к большему)
-            query += " ORDER BY p.green_percentage ASC LIMIT 10"
-
-            # Выполняем запрос
-            result = db.execute(text(query), params).fetchall()
-            print("result" + str(result))
-            # Дополнительная фильтрация по году и району в Python
-            filtered_results = []
-            for row in result:
-                # Извлекаем год постройки из описания
-                year = extract_year_from_description(row.description)
-                # Определяем район по адресу
-                district = get_district_from_address(row.address)
-
-                # Проверка года постройки
-                year_matches = True
-                if year is not None and user_filter.year_min is not None and year < user_filter.year_min:
-                    year_matches = False
-                if year is not None and user_filter.year_max is not None and year > user_filter.year_max:
-                    year_matches = False
-
-                # Проверка района
-                district_matches = True
-                if district is not None and user_filter.districts and len(
-                        user_filter.districts) > 0:
-                    if district not in user_filter.districts:
-                        district_matches = False
-
-                # Проверка этажа
-                floor, total_floors = extract_floor_info(row.description)
-                floor_matches = True
-
-                if floor is not None and total_floors is not None:
-                    if user_filter.not_first_floor and floor == 1:
-                        floor_matches = False
-                    if user_filter.not_last_floor and floor == total_floors:
-                        floor_matches = False
-                    if user_filter.min_floor is not None and floor < user_filter.min_floor:
-                        floor_matches = False
-                    if user_filter.max_floor is not None and floor > user_filter.max_floor:
-                        floor_matches = False
-
-                # Если все условия выполнены, добавляем объявление в результаты
-                if year_matches and district_matches and floor_matches:
-                    filtered_results.append(row)
-
-            # Отправляем найденные объявления пользователю
-            if filtered_results:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"🔔 Найдено {len(filtered_results)} новых объявлений, соответствующих вашим критериям!"
-                )
-
-                for row in filtered_results:
-                    # Вычисляем стоимость за кв.м
-                    price_per_sqm = row.price / row.square if row.square > 0 else 0
-
-                    # Извлекаем дополнительную информацию
-                    year = extract_year_from_description(row.description) or "Неизвестно"
-                    district = get_district_from_address(row.address) or "Неизвестно"
-                    floor, total_floors = extract_floor_info(row.description) or (None, None)
-                    floor_info = f"{floor}/{total_floors}" if floor and total_floors else "Неизвестно"
-
-                    message = (
-                        f"🏠 *{row.title or 'Квартира'}*\n"
-                        f"🏙️ Район: {district}\n"
-                        f"🏢 Год постройки: {year}\n"
-                        f"🔢 Этаж: {floor_info}\n"
-                        f"🚪 Комнат: {row.room}\n"
-                        f"📏 Площадь: {row.square} м²\n"
-                        f"💰 Цена: {row.price:,} тенге\n"
-                        f"📊 Цена за м²: {price_per_sqm:,.0f} тенге\n"
-                        f"📉 На {100 - row.green_percentage:.1f}% ниже рыночной\n"
-                        f"🔗 [Подробнее]({row.url})"
-                    )
-
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=message,
-                        parse_mode="Markdown"
-                    )
-
-            # Обновляем время последнего уведомления
-            if user.notifications:
-                user.notifications[0].last_sent_at = datetime.now()
-                db.commit()
-
-
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
-    finally:
-        db.close()
-
-
-def setup_schedulers(bot):
-    """Настраивает планировщики для всех пользователей."""
-    db = Session()
-    try:
-        users = db.query(User).all()
-        for user in users:
-            setup_user_scheduler(user.telegram_id, bot)
-    except Exception as e:
-        logger.error(f"Ошибка в setup_schedulers: {e}")
-    finally:
-        db.close()
-
-def setup_user_scheduler(user_id, bot):
-    """Настраивает планировщик для конкретного пользователя."""
-    db = Session()
-    try:
-        user = db.query(User).filter(User.telegram_id == user_id).first()
-        if not user or not user.notifications or not user.notifications[0].enabled:
-            return
-
-        notification_settings = user.notifications[0]
+        app = Application.get_current()
 
         # Имя задачи для этого пользователя
         job_id = f"notification_{user_id}"
 
-        # Удаляем существующую задачу, если есть
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
+        # Получаем список текущих заданий
+        current_jobs = app.job_queue.get_jobs_by_name(job_id)
+        for job in current_jobs:
+            job.schedule_removal()
 
         # Настраиваем новую задачу в зависимости от типа уведомлений
         if notification_settings.frequency_type == "daily":
@@ -1400,39 +1412,99 @@ def setup_user_scheduler(user_id, bot):
             hour = notification_settings.hour or 10
             minute = notification_settings.minute or 0
 
-            scheduler.add_job(
+            app.job_queue.run_daily(
                 send_notification,
-                CronTrigger(hour=hour, minute=minute),
-                args=[user_id, bot],
-                id=job_id,
-                replace_existing=True
+                time=datetime.time(hour=hour, minute=minute),
+                days=(0, 1, 2, 3, 4, 5, 6),
+                context={"user_id": user_id},
+                name=job_id
             )
+            logger.info(f"Настроено ежедневное уведомление для пользователя {user_id} на {hour}:{minute}")
+            
         elif notification_settings.frequency_type == "hourly":
-            # Периодическое уведомление с указанным интервалом
             # Периодическое уведомление с указанным интервалом
             interval_hours = notification_settings.interval_hours or 1
 
-            scheduler.add_job(
+            app.job_queue.run_repeating(
                 send_notification,
-                IntervalTrigger(hours=interval_hours),
-                args=[user_id, bot],
-                id=job_id,
-                replace_existing=True
+                interval=datetime.timedelta(hours=interval_hours),
+                first=0,
+                context={"user_id": user_id},
+                name=job_id
             )
+            logger.info(f"Настроено почасовое уведомление для пользователя {user_id} с интервалом {interval_hours} ч")
+    except Exception as e:
+        logger.error(f"Ошибка при настройке планировщика для пользователя {user_id}: {e}")
+    finally:
+        db.close()
+
+
+def setup_schedulers():
+    """Настраивает планировщики для всех пользователей."""
+    db = Session()
+    try:
+        users = db.query(User).all()
+        for user in users:
+            setup_user_scheduler(user.telegram_id)
+    except Exception as e:
+        logger.error(f"Ошибка в setup_schedulers: {e}")
     finally:
         db.close()
 
 
 def restart_user_scheduler(user_id):
     """Перезапускает планировщик для пользователя при изменении настроек."""
-    if not scheduler.running:
-        return
+    setup_user_scheduler(user_id)
 
-    # Получаем бота из текущего приложения
-    bot = Application.get_current().bot
 
-    # Перенастраиваем планировщик для пользователя
-    setup_user_scheduler(user_id, bot)
+async def test_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовая функция для немедленной отправки уведомлений."""
+    user_id = update.effective_user.id
+    await update.message.reply_text("Отправляю тестовое уведомление...")
+    
+    # Создаем контекст с нужными данными
+    context.job = type('obj', (object,), {
+        'context': {"user_id": user_id}
+    })
+    
+    # Вызываем функцию отправки уведомлений напрямую
+    await send_notification(context)
+    
+    return MAIN_MENU
+
+
+# Добавим команду для сброса истории отправленных объявлений
+async def reset_sent_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает историю отправленных объявлений для пользователя."""
+    user_id = update.effective_user.id
+    
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if user:
+            # Получаем количество удаляемых записей для информационного сообщения
+            count = db.query(SentProperty).filter(SentProperty.user_id == user.id).count()
+            
+            # Удаляем все записи о отправленных объявлениях для этого пользователя
+            db.query(SentProperty).filter(SentProperty.user_id == user.id).delete()
+            db.commit()
+            
+            await update.message.reply_text(
+                f"История отправленных объявлений сброшена! Удалено {count} записей."
+            )
+        else:
+            await update.message.reply_text(
+                "Не удалось найти ваш профиль в базе данных."
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при сбросе истории отправленных объявлений: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при сбросе истории. Пожалуйста, попробуйте позже."
+        )
+    finally:
+        db.close()
+    
+    return MAIN_MENU
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1453,14 +1525,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • Площадь\n"
         "   • Процент от рыночной цены\n\n"
 
-        "2. Настройте уведомления через меню 'Настройка уведомлений'\n"
+        "2. Просматривайте и сбрасывайте фильтры через меню 'Мои фильтры'\n"
+        "   • Просмотр всех активных фильтров\n"
+        "   • Сброс всех фильтров\n"
+        "   • Сброс отдельных фильтров\n\n"
+
+        "3. Настройте уведомления через меню 'Настройка уведомлений'\n"
         "   • Тип уведомлений (ежедневно или каждый час)\n"
         "   • Время уведомлений (для ежедневных)\n"
         "   • Интервал уведомлений (для периодических)\n\n"
 
-        "3. Используйте 'Поиск объявлений' для мгновенного поиска по вашим критериям\n\n"
+        "4. Используйте 'Поиск объявлений' для мгновенного поиска по вашим критериям\n\n"
+        
+        "5. Используйте 'Получить данные' для проверки работы системы\n\n"
 
-        "4. Просматривайте статистику через меню 'Статистика'\n\n"
+        "6. Просматривайте статистику через меню 'Статистика'\n\n"
 
         "Бот будет автоматически присылать вам новые объявления, соответствующие вашим критериям, в соответствии с настройками уведомлений."
     )
@@ -1491,11 +1570,1065 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_startup(application: Application):
-    # Start the scheduler
-    scheduler.start()
+    # Настраиваем планировщики для пользователей
+    setup_schedulers()
+    logger.info("Бот запущен и планировщики настроены")
 
-    # Setup user schedulers after application starts
-    setup_schedulers(application.bot)
+
+async def send_notification(context):
+    """Отправляет уведомление о новых объявлениях пользователю."""
+    user_id = context.job.context["user_id"]
+    bot = context.bot
+    
+    logger.info(f"Starting notification process for user {user_id}")
+    
+    db = Session()
+    try:
+        # Get user information
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if not user:
+            logger.info(f"User not found for user_id {user_id}")
+            return
+            
+        if not user.filters:
+            logger.info(f"No filters found for user_id {user_id}")
+            return
+
+        # Store necessary information from the user
+        user_id_db = user.id
+        
+        # Get all filter parameters and store locally before closing the session
+        if user.filters:
+            user_filter = user.filters[0]
+            # Copy all filter values to local variables to avoid detached object errors
+            year_min = user_filter.year_min
+            year_max = user_filter.year_max
+            districts = list(user_filter.districts) if user_filter.districts else []
+            not_first_floor = user_filter.not_first_floor
+            not_last_floor = user_filter.not_last_floor
+            min_floor = user_filter.min_floor
+            max_floor = user_filter.max_floor
+            rooms_min = user_filter.rooms_min
+            rooms_max = user_filter.rooms_max
+            price_min = user_filter.price_min
+            price_max = user_filter.price_max
+            area_min = user_filter.area_min
+            area_max = user_filter.area_max
+            max_market_price_percent = user_filter.max_market_price_percent
+            city = user_filter.city
+            address = user_filter.address
+        else:
+            logger.info(f"No filter found for user {user_id}")
+            return
+            
+        # Get sent property IDs in a separate query to avoid detached object issues
+        sent_property_ids = [sp.property_id for sp in db.query(SentProperty).filter(SentProperty.user_id == user_id_db).all()]
+        
+        # Close the initial session to avoid detached object issues
+        db.close()
+        logger.info(f"Initial session closed for user {user_id}")
+
+        # Строим SQL-запрос на основе фильтров пользователя
+        query = """
+                SELECT f.id, f.url, f.room, f.square, f.address, f.description, f.title,
+                       p.price, p.green_percentage
+                FROM flats f
+                JOIN (
+                    SELECT flat_id, price, green_percentage
+                    FROM prices
+                    WHERE (flat_id, date) IN (
+                        SELECT flat_id, MAX(date)
+                        FROM prices
+                        GROUP BY flat_id
+                    )
+                ) p ON f.id = p.flat_id
+                WHERE 1=1
+                """
+
+        params = {}
+
+        # Исключаем уже отправленные объявления
+        if sent_property_ids:
+            query += " AND f.id NOT IN :sent_property_ids"
+            params["sent_property_ids"] = tuple(sent_property_ids) if len(sent_property_ids) > 1 else f"({sent_property_ids[0]})"
+
+        # Фильтр по городу (с использованием ILIKE для регистро-независимого поиска)
+        if city:
+            query += " AND f.address ILIKE :city_pattern"
+            params["city_pattern"] = f"%{city}%"
+            
+        # Фильтр по адресу (с использованием ILIKE для регистро-независимого поиска)
+        if address:
+            query += " AND f.address ILIKE :address_pattern"
+            params["address_pattern"] = f"%{address}%"
+
+        # Фильтр по комнатам
+        if rooms_min is not None:
+            query += " AND f.room >= :rooms_min"
+            params["rooms_min"] = rooms_min
+
+        if rooms_max is not None:
+            query += " AND f.room <= :rooms_max"
+            params["rooms_max"] = rooms_max
+
+        # Фильтр по цене
+        if price_min is not None:
+            query += " AND p.price >= :price_min"
+            params["price_min"] = price_min
+
+        if price_max is not None:
+            query += " AND p.price <= :price_max"
+            params["price_max"] = price_max
+
+        # Фильтр по площади
+        if area_min is not None:
+            query += " AND f.square >= :area_min"
+            params["area_min"] = area_min
+
+        if area_max is not None:
+            query += " AND f.square <= :area_max"
+            params["area_max"] = area_max
+
+        # Фильтр по проценту от рыночной цены
+        if max_market_price_percent is not None and max_market_price_percent > 0:
+            query += " AND p.green_percentage >= :market_percent"
+            params["market_percent"] = max_market_price_percent
+
+        # Сортировка по проценту от рыночной цены (от большего к меньшему)
+        query += " ORDER BY p.green_percentage DESC LIMIT 10"
+
+        # Выполняем запрос и получаем данные
+        try:
+            # Используем свежее соединение для запроса
+            db_query = Session()
+            try:
+                logger.info(f"Executing main query for user {user_id}")
+                result = db_query.execute(text(query), params).fetchall()
+                db_query.commit()  # Завершаем транзакцию успешно
+                logger.info(f"Query returned {len(result)} results for user {user_id}")
+            except Exception as e:
+                db_query.rollback()  # Откатываем транзакцию при ошибке
+                logger.error(f"SQL error in main query for user {user_id}: {e}")
+                
+                # Пробуем более простой запрос без сложных условий
+                try:
+                    logger.info(f"Trying fallback query for user {user_id}")
+                    # Создаем новый запрос с базовыми фильтрами
+                    basic_query = """
+                        SELECT f.id, f.url, f.room, f.square, f.address, f.description, f.title,
+                               p.price, p.green_percentage
+                        FROM flats f
+                        JOIN (
+                            SELECT flat_id, price, green_percentage
+                            FROM prices
+                            WHERE (flat_id, date) IN (
+                                SELECT flat_id, MAX(date)
+                                FROM prices
+                                GROUP BY flat_id
+                            )
+                        ) p ON f.id = p.flat_id
+                        WHERE 1=1
+                    """
+                    
+                    basic_params = {}
+                    
+                    # Добавляем базовые фильтры по комнатам, цене и площади
+                    if rooms_min is not None:
+                        basic_query += " AND f.room >= :rooms_min"
+                        basic_params["rooms_min"] = rooms_min
+                    
+                    if rooms_max is not None:
+                        basic_query += " AND f.room <= :rooms_max"
+                        basic_params["rooms_max"] = rooms_max
+                    
+                    if price_min is not None:
+                        basic_query += " AND p.price >= :price_min"
+                        basic_params["price_min"] = price_min
+                    
+                    if price_max is not None:
+                        basic_query += " AND p.price <= :price_max"
+                        basic_params["price_max"] = price_max
+                    
+                    basic_query += " ORDER BY p.green_percentage DESC LIMIT 10"
+                    
+                    result = db_query.execute(text(basic_query), basic_params).fetchall()
+                    db_query.commit()
+                    logger.info(f"Fallback query returned {len(result)} results for user {user_id}")
+                except Exception as e2:
+                    db_query.rollback()
+                    logger.error(f"SQL error in fallback query for user {user_id}: {e2}")
+                    result = []
+            finally:
+                db_query.close()
+                logger.info(f"Query session closed for user {user_id}")
+                
+            # Получили результаты, теперь обрабатываем их
+            filtered_results = []
+            for row in result:
+                property_id = row[0]
+                url = row[1]
+                room = row[2]
+                square = row[3]
+                address = row[4]
+                description = row[5] or ''
+                title = row[6] or ''
+                price = row[7]
+                green_percentage = row[8]
+                
+                # Пропускаем уже отправленные объявления
+                if property_id in sent_property_ids:
+                    continue
+                
+                # Проверяем соответствие условиям фильтрации
+                extracted_year = extract_year_from_description(description)
+                district = get_district_from_address(address)
+                floor, total_floors = extract_floor_info(description)
+                
+                # Проверка года постройки
+                year_filter_passed = True
+                # Если год извлечен и фильтр установлен - проверяем соответствие
+                if extracted_year is not None:
+                    if year_min is not None and extracted_year < year_min:
+                        year_filter_passed = False
+                    if year_max is not None and extracted_year > year_max:
+                        year_filter_passed = False
+                # Если год не извлечен, но фильтр установлен - проверяем текст
+                elif year_min is not None or year_max is not None:
+                    # Проверяем, есть ли в тексте явное указание года
+                    if " г.п." in description.lower() or "год постройки" in description.lower() or "построен в" in description.lower():
+                        # Если есть упоминание года, проверяем соответствие любому году из диапазона
+                        year_range_start = year_min or 1900
+                        year_range_end = year_max or 2025
+                        year_mentions_found = False
+                        
+                        for check_year in range(year_range_start, year_range_end + 1):
+                            year_patterns = [
+                                f"{check_year} г.п.", 
+                                f"{check_year}г.п", 
+                                f"{check_year} год", 
+                                f"{check_year} года", 
+                                f"построен в {check_year}"
+                            ]
+                            if any(pattern in description.lower() for pattern in year_patterns):
+                                year_mentions_found = True
+                                break
+                                
+                        # Если упоминание года есть, но не соответствует фильтру
+                        if not year_mentions_found:
+                            year_filter_passed = False
+                
+                if not year_filter_passed:
+                    continue
+                
+                # Проверка района
+                district_filter_passed = True
+                if districts and len(districts) > 0:
+                    # Если район извлечен - проверяем соответствие
+                    if district is not None:
+                        # Case-insensitive comparison
+                        district_lower = district.lower()
+                        districts_lower = [d.lower() for d in districts]
+                        if district_lower not in districts_lower:
+                            # Район не соответствует, проверяем упоминания в тексте
+                            district_mentioned = False
+                            for d in districts:
+                                d_lower = d.lower()
+                                if (d_lower in description.lower() or 
+                                    d_lower in address.lower() or 
+                                    d_lower in title.lower()):
+                                    district_mentioned = True
+                                    break
+                            if not district_mentioned:
+                                district_filter_passed = False
+                    else:
+                        # Если район не извлечен, проверяем упоминания в тексте
+                        district_mentioned = False
+                        for d in districts:
+                            d_lower = d.lower()
+                            if (d_lower in description.lower() or 
+                                d_lower in address.lower() or 
+                                d_lower in title.lower()):
+                                district_mentioned = True
+                                break
+                        
+                        # Если упоминаний района нет, но в тексте есть слово "район", 
+                        # это может означать, что район указан не в нашем списке
+                        if not district_mentioned:
+                            if "район" in description.lower() or "район" in address.lower():
+                                district_filter_passed = False
+                
+                if not district_filter_passed:
+                    continue
+                
+                # Проверка этажа
+                floor_filter_passed = True
+                if floor is not None and total_floors is not None:
+                    # Проверка на первый этаж
+                    if not_first_floor and floor == 1:
+                        floor_filter_passed = False
+                    # Проверка на последний этаж
+                    if not_last_floor and floor == total_floors:
+                        floor_filter_passed = False
+                    # Проверка минимального этажа
+                    if min_floor is not None and floor < min_floor:
+                        floor_filter_passed = False
+                    # Проверка максимального этажа
+                    if max_floor is not None and floor > max_floor:
+                        floor_filter_passed = False
+                else:
+                    # Если этаж не извлечен, но фильтр установлен, проверяем текст
+                    has_floor_filters = (not_first_floor or 
+                                        not_last_floor or 
+                                        min_floor is not None or 
+                                        max_floor is not None)
+                    
+                    if has_floor_filters:
+                        # Ищем упоминания этажей в тексте
+                        floor_match = re.search(r'(\d+)/(\d+)', title + " " + description)
+                        if floor_match:
+                            # Если нашли паттерн этажа, проверяем соответствие
+                            try:
+                                extracted_floor = int(floor_match.group(1))
+                                extracted_total = int(floor_match.group(2))
+                                
+                                if not_first_floor and extracted_floor == 1:
+                                    floor_filter_passed = False
+                                if not_last_floor and extracted_floor == extracted_total:
+                                    floor_filter_passed = False
+                                if min_floor is not None and extracted_floor < min_floor:
+                                    floor_filter_passed = False
+                                if max_floor is not None and extracted_floor > max_floor:
+                                    floor_filter_passed = False
+                            except:
+                                pass
+                        else:
+                            # Проверяем явные упоминания первого/последнего этажа
+                            if not_first_floor:
+                                if "первый этаж" in description.lower() or "1 этаж" in description.lower() or "1-й этаж" in description.lower():
+                                    floor_filter_passed = False
+                            if not_last_floor:
+                                if "последний этаж" in description.lower() or "верхний этаж" in description.lower():
+                                    floor_filter_passed = False
+                
+                if not floor_filter_passed:
+                    continue
+                
+                # Объявление прошло все фильтры
+                filtered_results.append({
+                    'id': property_id,
+                    'url': url,
+                    'room': room,
+                    'square': square,
+                    'address': address,
+                    'description': description,
+                    'title': title,
+                    'price': price,
+                    'green_percentage': green_percentage
+                })
+            
+            # Отправляем найденные объявления пользователю
+            if filtered_results:
+                logger.info(f"Found {len(filtered_results)} filtered results for user {user_id}")
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔔 Найдено {len(filtered_results)} новых объявлений по вашим критериям!"
+                )
+                
+                sent_count = 0
+                
+                for property_data in filtered_results:
+                    # Форматируем сообщение с информацией об объявлении
+                    property_year = extract_year_from_description(property_data['description']) or "Неизвестно"
+                    property_district = get_district_from_address(property_data['address']) or "Неизвестно"
+                    
+                    # Сначала пробуем извлечь этаж из описания
+                    property_floor, property_total_floors = extract_floor_info(property_data['description']) or (None, None)
+                    
+                    # Если не получилось, пробуем извлечь из заголовка
+                    if property_floor is None or property_total_floors is None:
+                        title_floor_match = re.search(r'(\d+)/(\d+)\s*этаж', property_data['title'], re.IGNORECASE)
+                        if title_floor_match:
+                            property_floor = int(title_floor_match.group(1))
+                            property_total_floors = int(title_floor_match.group(2))
+                    
+                    # Пробуем поискать в объединенном тексте (заголовок + описание)
+                    if property_floor is None or property_total_floors is None:
+                        combined_text = property_data['title'] + " " + property_data['description']
+                        combined_match = re.search(r'(\d+)[/-](\d+)', combined_text)
+                        if combined_match:
+                            property_floor = int(combined_match.group(1))
+                            property_total_floors = int(combined_match.group(2))
+                    
+                    floor_info = f"{property_floor}/{property_total_floors}" if property_floor and property_total_floors else "Неизвестно"
+                    
+                    message = (
+                        f"🏠 *{property_data['title'] or 'Квартира'}*\n"
+                        f"🏙️ Район: {property_district}\n"
+                        f"🏢 Год постройки: {property_year}\n"
+                        f"🔢 Этаж: {floor_info}\n"
+                        f"🚪 Комнат: {property_data['room']}\n"
+                        f"📏 Площадь: {property_data['square']} м²\n"
+                        f"💰 Цена: {property_data['price']:,} тенге\n"
+                        f"📊 Цена за м²: {int(property_data['price'] / property_data['square']) if property_data['square'] else 0:,} тенге/м²\n"
+                        f"📉 От рыночной: {property_data['green_percentage']:.1f}%\n\n"
+                        f"🔗 [Подробнее]({property_data['url']})"
+                    )
+                    
+                    try:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=message,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True
+                        )
+                        
+                        # Сохраняем запись об отправленном объявлении
+                        # Используем новую сессию для каждой операции записи
+                        db_update = Session()
+                        try:
+                            new_sent_property = SentProperty(
+                                user_id=user_id_db,  # Using the ID we stored earlier
+                                property_id=property_data['id']
+                            )
+                            db_update.add(new_sent_property)
+                            db_update.commit()
+                            sent_count += 1
+                        except Exception as e:
+                            db_update.rollback()
+                            logger.error(f"Ошибка при сохранении отправленного объявления: {e}")
+                        finally:
+                            db_update.close()
+                            
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке сообщения: {e}")
+                
+                # Обновляем время последнего уведомления - используем новую сессию
+                db_notification = Session()
+                try:
+                    # Получаем свежие данные о настройках уведомлений
+                    notification = db_notification.query(NotificationSetting).filter(NotificationSetting.user_id == user_id_db).first()
+                    if notification:
+                        notification.last_sent_at = datetime.now()
+                        db_notification.commit()
+                except Exception as e:
+                    db_notification.rollback()
+                    logger.error(f"Ошибка при обновлении времени последнего уведомления: {e}")
+                finally:
+                    db_notification.close()
+                
+                logger.info(f"Отправлено {sent_count} объявлений пользователю {user_id}")
+            else:
+                logger.info(f"No matching properties found for user {user_id}")
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="На данный момент не найдено новых объявлений, соответствующих вашим критериям."
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке сообщения об отсутствии объявлений: {e}")
+        
+        except Exception as e:
+            logger.error(f"Необработанная ошибка в процессе отправки уведомлений для {user_id}: {e}", exc_info=True)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомлений для {user_id}: {e}", exc_info=True)
+    finally:
+        if 'db' in locals() and db:
+            try:
+                db.close()
+                logger.info(f"Final database connection closed for user {user_id}")
+            except:
+                pass
+
+
+async def handle_districts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод районов пользователем."""
+    text = update.message.text
+    
+    # Split the input by commas and clean up spaces - make lowercase for case-insensitive comparison
+    districts = [district.strip() for district in text.split(',') if district.strip()]
+    
+    if not districts:
+        await update.message.reply_text(
+            "Пожалуйста, введите хотя бы один район:"
+        )
+        return DISTRICTS
+    
+    # Update in database
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if user and user.filters:
+            user.filters[0].districts = districts
+            db.commit()
+            
+            await update.message.reply_text(
+                f"Районы для поиска установлены: {', '.join(districts)}. Выберите параметр для настройки:",
+                reply_markup=get_filter_menu_keyboard()
+            )
+            return FILTER_MENU
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении районов: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при сохранении районов. Пожалуйста, попробуйте еще раз."
+        )
+        return DISTRICTS
+    finally:
+        db.close()
+
+
+# Функция для отображения текущих фильтров
+async def show_current_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущие фильтры пользователя и предлагает их сбросить."""
+    user_id = update.effective_user.id
+    
+    logger.info(f"Showing current filters for user {user_id}")
+    
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if not user or not user.filters:
+            await update.message.reply_text(
+                "У вас еще не настроены фильтры. Используйте меню 'Настройка фильтров'."
+            )
+            return MAIN_MENU
+        
+        user_filter = user.filters[0]
+        
+        # Формируем сообщение со списком текущих фильтров
+        message = "🔍 *Ваши текущие фильтры:*\n\n"
+        
+        # Год постройки
+        if user_filter.year_min is not None or user_filter.year_max is not None:
+            year_min = user_filter.year_min or "не указан"
+            year_max = user_filter.year_max or "не указан"
+            message += f"🏢 *Год постройки:* {year_min} - {year_max}\n"
+        else:
+            message += "🏢 *Год постройки:* не указан\n"
+        
+        # Районы
+        if user_filter.districts and len(user_filter.districts) > 0:
+            message += f"🏙️ *Районы:* {', '.join(user_filter.districts)}\n"
+        else:
+            message += "🏙️ *Районы:* не указаны\n"
+        
+        # Город
+        if user_filter.city:
+            message += f"🌃 *Город:* {user_filter.city}\n"
+        else:
+            message += "🌃 *Город:* не указан\n"
+            
+        # Адрес
+        if user_filter.address:
+            message += f"📍 *Адрес:* {user_filter.address}\n"
+        else:
+            message += "📍 *Адрес:* не указан\n"
+        
+        # Этажи
+        floor_filters = []
+        if user_filter.not_first_floor:
+            floor_filters.append("не первый")
+        if user_filter.not_last_floor:
+            floor_filters.append("не последний")
+        if user_filter.min_floor is not None:
+            floor_filters.append(f"от {user_filter.min_floor}")
+        if user_filter.max_floor is not None:
+            floor_filters.append(f"до {user_filter.max_floor}")
+        
+        if floor_filters:
+            message += f"🔢 *Этажи:* {', '.join(floor_filters)}\n"
+        else:
+            message += "🔢 *Этажи:* не указаны\n"
+        
+        # Комнаты
+        if user_filter.rooms_min is not None or user_filter.rooms_max is not None:
+            if user_filter.rooms_min == user_filter.rooms_max:
+                message += f"🚪 *Комнаты:* {user_filter.rooms_min}\n"
+            else:
+                rooms_min = user_filter.rooms_min or "не указано"
+                rooms_max = user_filter.rooms_max or "не указано"
+                message += f"🚪 *Комнаты:* {rooms_min} - {rooms_max}\n"
+        else:
+            message += "🚪 *Комнаты:* не указаны\n"
+        
+        # Цена
+        if user_filter.price_min is not None or user_filter.price_max is not None:
+            price_min = f"{user_filter.price_min:,}" if user_filter.price_min else "не указана"
+            price_max = f"{user_filter.price_max:,}" if user_filter.price_max else "не указана"
+            message += f"💰 *Цена:* {price_min} - {price_max} тенге\n"
+        else:
+            message += "💰 *Цена:* не указана\n"
+        
+        # Площадь
+        if user_filter.area_min is not None or user_filter.area_max is not None:
+            area_min = user_filter.area_min or "не указана"
+            area_max = user_filter.area_max or "не указана"
+            message += f"📏 *Площадь:* {area_min} - {area_max} м²\n"
+        else:
+            message += "📏 *Площадь:* не указана\n"
+        
+        # Процент от рыночной цены
+        if user_filter.max_market_price_percent is not None:
+            message += f"📉 *От рыночной цены:* до {user_filter.max_market_price_percent}%\n"
+        else:
+            message += "📉 *От рыночной цены:* не указан\n"
+        
+        # Создаем клавиатуру для сброса фильтров
+        keyboard = [
+            [InlineKeyboardButton("🔄 Сбросить все фильтры", callback_data="reset_all_filters")],
+            [InlineKeyboardButton("🏢 Сбросить год постройки", callback_data="reset_filter_year")],
+            [InlineKeyboardButton("🏙️ Сбросить районы", callback_data="reset_filter_districts")],
+            [InlineKeyboardButton("🌃 Сбросить город", callback_data="reset_filter_city")],
+            [InlineKeyboardButton("📍 Сбросить адрес", callback_data="reset_filter_address")],
+            [InlineKeyboardButton("🔢 Сбросить этажи", callback_data="reset_filter_floors")],
+            [InlineKeyboardButton("🚪 Сбросить комнаты", callback_data="reset_filter_rooms")],
+            [InlineKeyboardButton("💰 Сбросить цену", callback_data="reset_filter_price")],
+            [InlineKeyboardButton("📏 Сбросить площадь", callback_data="reset_filter_area")],
+            [InlineKeyboardButton("📉 Сбросить % от рынка", callback_data="reset_filter_market")]
+        ]
+        
+        sent_message = await update.message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"Displayed filter information and reset buttons for user {user_id}")
+        
+        # State transition to RESET_FILTERS
+        return RESET_FILTERS
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отображении фильтров: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при загрузке ваших фильтров. Пожалуйста, попробуйте позже."
+        )
+        return MAIN_MENU
+    finally:
+        db.close()
+
+
+async def handle_reset_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает сброс фильтров пользователя."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    data = query.data
+    
+    logger.info(f"Reset filter request: {data} for user {user_id}")
+    
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == user_id).first()
+        if not user or not user.filters:
+            await query.edit_message_text(
+                "У вас еще не настроены фильтры. Используйте меню 'Настройка фильтров'."
+            )
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=get_main_keyboard()
+            )
+            return MAIN_MENU
+        
+        user_filter = user.filters[0]
+        
+        if data == "reset_all_filters":
+            # Log before update
+            logger.info(f"Before reset - Year: {user_filter.year_min}-{user_filter.year_max}, Districts: {user_filter.districts}")
+            
+            # Сбрасываем все фильтры на значения по умолчанию
+            user_filter.year_min = None
+            user_filter.year_max = None
+            user_filter.districts = []
+            user_filter.not_first_floor = False
+            user_filter.not_last_floor = False
+            user_filter.min_floor = None
+            user_filter.max_floor = None
+            user_filter.rooms_min = None
+            user_filter.rooms_max = None
+            user_filter.price_min = None
+            user_filter.price_max = None
+            user_filter.area_min = None
+            user_filter.area_max = None
+            user_filter.max_market_price_percent = 0.0
+            user_filter.city = None
+            user_filter.address = None
+            
+            # Log after update but before commit
+            logger.info(f"After reset, before commit - Year: {user_filter.year_min}-{user_filter.year_max}, Districts: {user_filter.districts}")
+            
+            db.commit()
+            
+            # Log after commit
+            logger.info("Reset all filters - Commit successful")
+            
+            # Verify the changes were saved
+            db.refresh(user_filter)
+            logger.info(f"After commit and refresh - Year: {user_filter.year_min}-{user_filter.year_max}, Districts: {user_filter.districts}")
+            
+            await query.edit_message_text(
+                "Все фильтры успешно сброшены!"
+            )
+        elif data == "reset_filter_year":
+            # Сбрасываем фильтр года постройки
+            logger.info(f"Before reset - Year: {user_filter.year_min}-{user_filter.year_max}")
+            user_filter.year_min = None
+            user_filter.year_max = None
+            db.commit()
+            logger.info("Reset year filter - Commit successful")
+            
+            # Verify
+            db.refresh(user_filter)
+            logger.info(f"After commit - Year: {user_filter.year_min}-{user_filter.year_max}")
+            
+            await query.edit_message_text(
+                "Фильтр года постройки сброшен. Теперь будут показаны объявления с любым годом постройки."
+            )
+        elif data == "reset_filter_districts":
+            # Сбрасываем фильтр районов
+            logger.info(f"Before reset - Districts: {user_filter.districts}")
+            user_filter.districts = []
+            db.commit()
+            logger.info("Reset districts filter - Commit successful")
+            
+            # Verify
+            db.refresh(user_filter)
+            logger.info(f"After commit - Districts: {user_filter.districts}")
+            
+            await query.edit_message_text(
+                "Фильтр районов сброшен. Теперь будут показаны объявления из всех районов."
+            )
+        elif data == "reset_filter_city":
+            # Сбрасываем фильтр города
+            logger.info(f"Before reset - City: {user_filter.city}")
+            user_filter.city = None
+            db.commit()
+            logger.info("Reset city filter - Commit successful")
+            
+            # Verify
+            db.refresh(user_filter)
+            logger.info(f"After commit - City: {user_filter.city}")
+            
+            await query.edit_message_text(
+                "Фильтр города сброшен. Теперь будут показаны объявления из всех городов."
+            )
+        elif data == "reset_filter_address":
+            # Сбрасываем фильтр адреса
+            logger.info(f"Before reset - Address: {user_filter.address}")
+            user_filter.address = None
+            db.commit()
+            logger.info("Reset address filter - Commit successful")
+            
+            # Verify
+            db.refresh(user_filter)
+            logger.info(f"After commit - Address: {user_filter.address}")
+            
+            await query.edit_message_text(
+                "Фильтр адреса сброшен. Теперь будут показаны объявления с любыми адресами."
+            )
+        elif data == "reset_filter_floors":
+            # Сбрасываем фильтр этажей
+            logger.info(f"Before reset - Floors: min={user_filter.min_floor}, max={user_filter.max_floor}, not_first={user_filter.not_first_floor}, not_last={user_filter.not_last_floor}")
+            user_filter.not_first_floor = False
+            user_filter.not_last_floor = False
+            user_filter.min_floor = None
+            user_filter.max_floor = None
+            db.commit()
+            logger.info("Reset floors filter - Commit successful")
+            
+            await query.edit_message_text(
+                "Фильтр этажей сброшен. Теперь будут показаны объявления с любым этажом."
+            )
+        elif data == "reset_filter_rooms":
+            # Сбрасываем фильтр комнат
+            logger.info(f"Before reset - Rooms: min={user_filter.rooms_min}, max={user_filter.rooms_max}")
+            user_filter.rooms_min = None
+            user_filter.rooms_max = None
+            db.commit()
+            logger.info("Reset rooms filter - Commit successful")
+            
+            await query.edit_message_text(
+                "Фильтр комнат сброшен. Теперь будут показаны объявления с любым количеством комнат."
+            )
+        elif data == "reset_filter_price":
+            # Сбрасываем фильтр цены
+            logger.info(f"Before reset - Price: min={user_filter.price_min}, max={user_filter.price_max}")
+            user_filter.price_min = None
+            user_filter.price_max = None
+            db.commit()
+            logger.info("Reset price filter - Commit successful")
+            
+            await query.edit_message_text(
+                "Фильтр цены сброшен. Теперь будут показаны объявления с любой ценой."
+            )
+        elif data == "reset_filter_area":
+            # Сбрасываем фильтр площади
+            logger.info(f"Before reset - Area: min={user_filter.area_min}, max={user_filter.area_max}")
+            user_filter.area_min = None
+            user_filter.area_max = None
+            db.commit()
+            logger.info("Reset area filter - Commit successful")
+            
+            await query.edit_message_text(
+                "Фильтр площади сброшен. Теперь будут показаны объявления с любой площадью."
+            )
+        elif data == "reset_filter_market":
+            # Сбрасываем фильтр процента от рыночной цены
+            logger.info(f"Before reset - Market percent: {user_filter.max_market_price_percent}")
+            user_filter.max_market_price_percent = 0.0
+            db.commit()
+            logger.info("Reset market percent filter - Commit successful")
+            
+            await query.edit_message_text(
+                "Фильтр процента от рыночной цены сброшен. Теперь будут показаны объявления с любым процентом."
+            )
+        else:
+            logger.warning(f"Unknown filter reset command: {data}")
+            await query.edit_message_text(
+                "Неизвестный тип фильтра. Пожалуйста, попробуйте еще раз."
+            )
+            await query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=get_main_keyboard()
+            )
+            return MAIN_MENU
+        
+        # После сброса фильтров перезапускаем планировщик для обновления уведомлений
+        try:
+            restart_user_scheduler(user_id)
+            logger.info(f"Restarted scheduler for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error restarting scheduler: {e}")
+        
+        # Отправляем сообщение с предложением вернуться в главное меню
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=get_main_keyboard()
+        )
+        
+        logger.info(f"Filter reset completed successfully for {data}, user {user_id}")
+        return MAIN_MENU
+        
+    except Exception as e:
+        logger.error(f"Ошибка при сбросе фильтров: {e}", exc_info=True)
+        await query.edit_message_text(
+            "Произошла ошибка при сбросе фильтров. Пожалуйста, попробуйте позже."
+        )
+        await query.message.reply_text(
+            "Выберите действие:",
+            reply_markup=get_main_keyboard()
+        )
+        return MAIN_MENU
+    finally:
+        if 'db' in locals() and db:
+            db.close()
+            logger.info("Database connection closed")
+
+
+async def handle_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод города."""
+    city = update.message.text.strip()
+    
+    if not city:
+        await update.message.reply_text(
+            "Пожалуйста, введите название города:"
+        )
+        return CITY
+    
+    # Update in database
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if user and user.filters:
+            user.filters[0].city = city
+            db.commit()
+            
+            await update.message.reply_text(
+                f"Город для поиска установлен: {city}. Выберите параметр для настройки:",
+                reply_markup=get_filter_menu_keyboard()
+            )
+            return FILTER_MENU
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении города: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при сохранении города. Пожалуйста, попробуйте еще раз."
+        )
+        return CITY
+    finally:
+        db.close()
+
+
+async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод адреса."""
+    address = update.message.text.strip()
+    
+    if not address:
+        await update.message.reply_text(
+            "Пожалуйста, введите часть адреса:"
+        )
+        return ADDRESS
+    
+    # Update in database
+    db = Session()
+    try:
+        user = db.query(User).filter(User.telegram_id == update.effective_user.id).first()
+        if user and user.filters:
+            user.filters[0].address = address
+            db.commit()
+            
+            await update.message.reply_text(
+                f"Часть адреса для поиска установлена: {address}. Выберите параметр для настройки:",
+                reply_markup=get_filter_menu_keyboard()
+            )
+            return FILTER_MENU
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении адреса: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при сохранении адреса. Пожалуйста, попробуйте еще раз."
+        )
+        return ADDRESS
+    finally:
+        db.close()
+
+
+async def admin_overall_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает общую статистику для администратора."""
+    user_id = update.effective_user.id
+    
+    # Проверка прав администратора
+    if user_id != ADMIN_TELEGRAM_ID:
+        logger.warning(f"Non-admin user {user_id} tried to access admin_overall_statistics")
+        await update.message.reply_text(
+            "У вас нет прав для выполнения этой команды.",
+            reply_markup=get_main_keyboard(is_admin=False)
+        )
+        return MAIN_MENU
+    
+    db = Session()
+    try:
+        # Общая статистика пользователей
+        total_users = db.query(User).count()
+        active_users = db.query(User).join(NotificationSetting).filter(NotificationSetting.enabled == True).count()
+        
+        # Статистика по фильтрам
+        filters_count = db.query(UserFilter).count()
+        
+        # Статистика по отправленным объявлениям
+        total_sent = db.query(SentProperty).count()
+        
+        # Наиболее популярные районы
+        district_counts = {}
+        user_filters = db.query(UserFilter).all()
+        for uf in user_filters:
+            if uf.districts:
+                for district in uf.districts:
+                    district_counts[district] = district_counts.get(district, 0) + 1
+        
+        popular_districts = sorted(district_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        # Статистика по годам постройки
+        year_min_avg = db.query(func.avg(UserFilter.year_min)).filter(UserFilter.year_min != None).scalar() or 0
+        year_max_avg = db.query(func.avg(UserFilter.year_max)).filter(UserFilter.year_max != None).scalar() or 0
+        
+        # Статистика по ценам
+        price_min_avg = db.query(func.avg(UserFilter.price_min)).filter(UserFilter.price_min != None).scalar() or 0
+        price_max_avg = db.query(func.avg(UserFilter.price_max)).filter(UserFilter.price_max != None).scalar() or 0
+        
+        # Формируем сообщение
+        message = "📊 *Общая статистика бота*\n\n"
+        message += f"👥 *Пользователи:*\n"
+        message += f"  • Всего: {total_users}\n"
+        message += f"  • С активными уведомлениями: {active_users}\n\n"
+        
+        message += f"🔍 *Фильтры:*\n"
+        message += f"  • Всего настроено: {filters_count}\n"
+        message += f"  • Средний диапазон годов: {int(year_min_avg)} - {int(year_max_avg)}\n"
+        message += f"  • Средний диапазон цен: {int(price_min_avg):,} - {int(price_max_avg):,} тенге\n\n"
+        
+        message += f"📬 *Отправленные объявления:*\n"
+        message += f"  • Всего отправлено: {total_sent}\n\n"
+        
+        message += f"🏙️ *Популярные районы:*\n"
+        for district, count in popular_districts[:5]:
+            message += f"  • {district}: {count} пользователей\n"
+        
+        await update.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(is_admin=True)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при получении общей статистики: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при загрузке статистики. Пожалуйста, попробуйте позже.",
+            reply_markup=get_main_keyboard(is_admin=True)
+        )
+    finally:
+        db.close()
+
+
+async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает отправку сообщения всем пользователям."""
+    user_id = update.effective_user.id
+    
+    # Проверка прав администратора
+    if user_id != ADMIN_TELEGRAM_ID:
+        logger.warning(f"Non-admin user {user_id} tried to access handle_admin_broadcast")
+        await update.message.reply_text(
+            "У вас нет прав для выполнения этой команды.",
+            reply_markup=get_main_keyboard(is_admin=False)
+        )
+        return MAIN_MENU
+    
+    message_text = update.message.text
+    if not message_text or message_text.strip() == "":
+        await update.message.reply_text(
+            "Пожалуйста, введите текст сообщения для отправки.",
+            reply_markup=get_main_keyboard(is_admin=True)
+        )
+        return ADMIN_BROADCAST
+    
+    # Начинаем отправку
+    await update.message.reply_text(
+        "Начинаю отправку сообщения всем пользователям..."
+    )
+    
+    db = Session()
+    try:
+        # Получаем всех пользователей
+        users = db.query(User).all()
+        sent_count = 0
+        failed_count = 0
+        
+        for user in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user.telegram_id,
+                    text=f"📢 *Сообщение от администратора:*\n\n{message_text}",
+                    parse_mode="Markdown"
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Ошибка при отправке сообщения пользователю {user.telegram_id}: {e}")
+                failed_count += 1
+        
+        await update.message.reply_text(
+            f"✅ Отправка завершена!\n\n"
+            f"Сообщение отправлено {sent_count} пользователям.\n"
+            f"Не удалось отправить {failed_count} пользователям.",
+            reply_markup=get_main_keyboard(is_admin=True)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при массовой отправке сообщений: {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при отправке сообщений. Пожалуйста, попробуйте позже.",
+            reply_markup=get_main_keyboard(is_admin=True)
+        )
+    finally:
+        db.close()
+    
+    return MAIN_MENU
+
 
 def main():
     """Запускает бота."""
@@ -1508,7 +2641,9 @@ def main():
         .post_init(on_startup) \
         .build()
 
-
+    # Create a separate handler for reset filter callbacks
+    reset_filter_handler = CallbackQueryHandler(handle_reset_filters, pattern='^(reset_all_filters|reset_filter_year|reset_filter_districts|reset_filter_city|reset_filter_address|reset_filter_floors|reset_filter_rooms|reset_filter_price|reset_filter_area|reset_filter_market)')
+    
     # Создаем конверсейшн хэндлер для основного меню
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1527,7 +2662,8 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year_max)
             ],
             DISTRICTS: [
-                CallbackQueryHandler(handle_filter_menu)
+                CallbackQueryHandler(handle_filter_menu),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_districts)
             ],
             FLOOR_SETTINGS: [
                 CallbackQueryHandler(handle_filter_menu)
@@ -1550,6 +2686,12 @@ def main():
             MARKET_PERCENT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_market_percent)
             ],
+            CITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city)
+            ],
+            ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address)
+            ],
             NOTIFICATION_MENU: [
                 CallbackQueryHandler(handle_notification_menu)
             ],
@@ -1560,20 +2702,26 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_time)
             ],
             NOTIFICATION_INTERVAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND,
-                               handle_notification_interval)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_interval)
             ],
+            RESET_FILTERS: [
+                reset_filter_handler,
+            ],
+            ADMIN_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast)
+            ]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
 
     application.add_error_handler(error_handler)
+    application.add_handler(reset_filter_handler)  # Add the handler outside the conversation too
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("reset", reset_sent_properties))
 
     # Настраиваем планировщики при запуске
-    setup_schedulers(application.bot)
+    setup_schedulers()
     # Запускаем бота
     application.run_polling()
 

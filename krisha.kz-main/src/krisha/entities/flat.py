@@ -14,7 +14,6 @@ class Flat:
     lat: float
     lon: float
     description: str
-    photo: str
     price: int
     green_percentage: float
     address: str

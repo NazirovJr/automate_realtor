@@ -22,7 +22,6 @@ def create_db(connector: DBConnection) -> None:
             lat         REAL,
             lon         REAL,
             description TEXT,
-            photo       TEXT,
             address     TEXT,
             title       VARCHAR(255),
             star        INTEGER DEFAULT 0,
@@ -39,7 +38,7 @@ def create_db(connector: DBConnection) -> None:
             UNIQUE (date, flat_id)
         );
     """
-    with connector as con:
+    with connector.connection as con:
         with con.cursor() as cursor:
             cursor.execute(query)
             con.commit()

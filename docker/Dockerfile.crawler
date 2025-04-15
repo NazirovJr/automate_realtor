@@ -1,0 +1,27 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install cron
+RUN apt-get update && apt-get install -y cron && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY krisha.kz-main/pyproject.toml ./
+COPY krisha.kz-main/logging.ini ./
+COPY krisha.kz-main/SEARCH_PARAMETERS.json ./
+
+# Install Python dependencies using pip directly
+RUN pip install --upgrade pip && \
+    pip install beautifulsoup4==4.12.3 colorlog==6.8.2 requests==2.31.0 tqdm==4.66.2 psycopg2-binary==2.9.9
+
+# Copy source code
+COPY krisha.kz-main/src ./src
+COPY krisha.kz-main/cron.sh ./
+COPY docker/crawler_cron.sh /crawler_cron.sh
+
+# Make scripts executable
+RUN chmod +x /app/cron.sh && \
+    chmod +x /crawler_cron.sh
+
+# Run crawler once at startup, then let cron manage the schedule
+CMD ["/bin/bash", "-c", "python -m src.krisha.main && /crawler_cron.sh"] 

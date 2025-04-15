@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database service
+  db:
+    image: postgres:15
+    container_name: krisha-db
+    restart: always
+    environment:
+      POSTGRES_DB: krisha
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Krisha crawler service
+  crawler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.crawler
+    container_name: krisha-crawler
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: krisha
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    volumes:
+      - ./logs:/app/logs
+    restart: always
+
+  # Telegram bot service
+  telegram:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.telegram
+    container_name: krisha-telegram
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db/krisha
+    env_file:
+      - krisha.kz.tg/.env
+    restart: always
+
+volumes:
+  postgres_data: 
