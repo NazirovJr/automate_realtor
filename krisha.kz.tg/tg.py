@@ -1,8 +1,14 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import os
 from dotenv import load_dotenv
+import atexit
+import errno
+import sys
+import time
+import json
+import random
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, JSON, UniqueConstraint, func, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
@@ -12,10 +18,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, \
-    ConversationHandler
-
-from telegram.error import TelegramError
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+from telegram.error import Conflict
 
 # Загрузка переменных среды из .env файла
 load_dotenv()
@@ -1560,13 +1564,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Exception while handling update:", exc_info=context.error)
-
-    if isinstance(context.error, TelegramError):
+    logger.error(f"Exception while handling update: {context.error}")
+    
+    # Check if update exists and has a chat
+    if update and update.effective_chat:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="⚠️ Произошла ошибка. Пожалуйста, попробуйте еще раз."
+            text="Произошла ошибка при обработке вашего запроса. Попробуйте позже или свяжитесь с администратором."
         )
+    else:
+        # Log additional details if update is None
+        if isinstance(context.error, Conflict):
+            logger.error("Multiple bot instances detected. Please ensure only one instance is running.")
+        else:
+            logger.error(f"Error occurred outside user interaction: {context.error}")
 
 
 async def on_startup(application: Application):
@@ -2632,98 +2643,153 @@ async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_T
 
 def main():
     """Запускает бота."""
-    # Создаем приложение
-    # Инициализация базы данных
-    Base.metadata.create_all(bind=engine)
-
-    application = Application.builder() \
-        .token(TOKEN) \
-        .post_init(on_startup) \
-        .build()
-
-    # Create a separate handler for reset filter callbacks
-    reset_filter_handler = CallbackQueryHandler(handle_reset_filters, pattern='^(reset_all_filters|reset_filter_year|reset_filter_districts|reset_filter_city|reset_filter_address|reset_filter_floors|reset_filter_rooms|reset_filter_price|reset_filter_area|reset_filter_market)')
+    # Создаем lock-файл для предотвращения запуска нескольких экземпляров
+    lock_file = "/tmp/krisha_tg_bot.lock"
     
-    # Создаем конверсейшн хэндлер для основного меню
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MAIN_MENU: [
-                CallbackQueryHandler(handle_main_menu),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu)
-            ],
-            FILTER_MENU: [
-                CallbackQueryHandler(handle_filter_menu)
-            ],
-            YEAR_MIN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year_min)
-            ],
-            YEAR_MAX: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year_max)
-            ],
-            DISTRICTS: [
-                CallbackQueryHandler(handle_filter_menu),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_districts)
-            ],
-            FLOOR_SETTINGS: [
-                CallbackQueryHandler(handle_filter_menu)
-            ],
-            MIN_FLOOR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_min_floor)
-            ],
-            MAX_FLOOR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_max_floor)
-            ],
-            ROOMS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rooms)
-            ],
-            PRICE_RANGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_range)
-            ],
-            AREA_RANGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_area_range)
-            ],
-            MARKET_PERCENT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_market_percent)
-            ],
-            CITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city)
-            ],
-            ADDRESS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address)
-            ],
-            NOTIFICATION_MENU: [
-                CallbackQueryHandler(handle_notification_menu)
-            ],
-            NOTIFICATION_TYPE: [
-                CallbackQueryHandler(handle_notification_menu)
-            ],
-            NOTIFICATION_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_time)
-            ],
-            NOTIFICATION_INTERVAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_interval)
-            ],
-            RESET_FILTERS: [
-                reset_filter_handler,
-            ],
-            ADMIN_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast)
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
+    try:
+        # Try to create a lock file with exclusive access
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        
+        # Write PID to lock file
+        os.write(lock_fd, str(os.getpid()).encode())
+        os.close(lock_fd)
+        
+        # Register cleanup to remove lock on exit
+        import atexit
+        atexit.register(lambda: os.unlink(lock_file) if os.path.exists(lock_file) else None)
+        
+        logger.info("Bot starting with lock file created")
+        
+        # Инициализация базы данных
+        Base.metadata.create_all(bind=engine)
 
-    application.add_error_handler(error_handler)
-    application.add_handler(reset_filter_handler)  # Add the handler outside the conversation too
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("reset", reset_sent_properties))
+        # Configure the application
+        application = Application.builder() \
+            .token(TOKEN) \
+            .post_init(on_startup) \
+            .build()
 
-    # Настраиваем планировщики при запуске
-    setup_schedulers()
-    # Запускаем бота
-    application.run_polling()
+        # Create a separate handler for reset filter callbacks
+        reset_filter_handler = CallbackQueryHandler(handle_reset_filters, pattern='^(reset_all_filters|reset_filter_year|reset_filter_districts|reset_filter_city|reset_filter_address|reset_filter_floors|reset_filter_rooms|reset_filter_price|reset_filter_area|reset_filter_market)')
+        
+        # Создаем конверсейшн хэндлер для основного меню
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                MAIN_MENU: [
+                    CallbackQueryHandler(handle_main_menu),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu)
+                ],
+                FILTER_MENU: [
+                    CallbackQueryHandler(handle_filter_menu)
+                ],
+                YEAR_MIN: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year_min)
+                ],
+                YEAR_MAX: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year_max)
+                ],
+                DISTRICTS: [
+                    CallbackQueryHandler(handle_filter_menu),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_districts)
+                ],
+                FLOOR_SETTINGS: [
+                    CallbackQueryHandler(handle_filter_menu)
+                ],
+                MIN_FLOOR: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_min_floor)
+                ],
+                MAX_FLOOR: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_max_floor)
+                ],
+                ROOMS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rooms)
+                ],
+                PRICE_RANGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_range)
+                ],
+                AREA_RANGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_area_range)
+                ],
+                MARKET_PERCENT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_market_percent)
+                ],
+                CITY: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city)
+                ],
+                ADDRESS: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address)
+                ],
+                NOTIFICATION_MENU: [
+                    CallbackQueryHandler(handle_notification_menu)
+                ],
+                NOTIFICATION_TYPE: [
+                    CallbackQueryHandler(handle_notification_menu)
+                ],
+                NOTIFICATION_TIME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_time)
+                ],
+                NOTIFICATION_INTERVAL: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_notification_interval)
+                ],
+                RESET_FILTERS: [
+                    reset_filter_handler,
+                ],
+                ADMIN_BROADCAST: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_broadcast)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            per_message=False,  # Changed to False to allow mixed handler types
+            name="main_conversation"
+        )
+
+        application.add_error_handler(error_handler)
+        application.add_handler(reset_filter_handler)  # Add the handler outside the conversation too
+        application.add_handler(conv_handler)
+        
+        # Add direct command handlers for essential commands
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("reset", reset_sent_properties))
+        
+        # Add a general message handler with lower priority to catch any text messages outside conversation
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_main_menu), group=1)
+
+        # Настраиваем планировщики при запуске
+        setup_schedulers()
+        
+        # Запускаем бота с простыми настройками
+        logger.info("Starting bot polling")
+        application.run_polling(drop_pending_updates=True)
+        
+    except OSError as e:
+        import errno, sys
+        if e.errno == errno.EEXIST:
+            logger.error("Another instance of the bot is already running. Exiting.")
+            try:
+                # Try to read PID from existing lock file
+                with open(lock_file, 'r') as f:
+                    pid = f.read().strip()
+                    logger.error(f"Bot is already running with PID: {pid}")
+                    
+                # Check if process is actually running
+                try:
+                    os.kill(int(pid), 0)  # Signal 0 doesn't kill but checks if process exists
+                except (OSError, ValueError):
+                    logger.warning("Stale lock file detected. The previous instance may have crashed.")
+                    # You can choose to remove stale lock and retry
+                    logger.info("Removing stale lock file...")
+                    os.unlink(lock_file)
+                    logger.info("Please restart the bot.")
+            except (IOError, ValueError) as read_error:
+                logger.error(f"Error reading lock file: {read_error}")
+            
+            sys.exit(1)
+        else:
+            # Other OS errors
+            logger.error(f"OS error: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

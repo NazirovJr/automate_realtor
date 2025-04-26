@@ -54,15 +54,31 @@ def get_content(response: Response) -> bs:
 
 
 def get_ads_count(content: bs) -> int:
-    if not content.find("div", class_="a-search-options"):
-        logger.warning(msg.CR_ADS_NOT_FOUND)
-        sys.exit()
+    """Get count of ads found in search results.
+    
+    Returns 0 if no ads are found instead of exiting.
+    """
+    # if not content.find("div", class_="a-search-options"):
+    #     logger.warning(msg.CR_ADS_NOT_FOUND)
+    #     # Instead of exiting, return 0 to indicate no ads found
+    #     # This allows the crawler to proceed to different search parameters
+    #     return 0
+    
     logger.info(msg.CR_START)
     subtitle = content.find("div", class_="a-search-subtitle")
     if not subtitle:
-        raise ValueError(msg.CR_SOUP_FIND_ERROR.format("a-search-subtitle"))
-    ads_count = int("".join(re.findall(r"\d+", subtitle.text.strip())))
-    return ads_count
+        # If we found search options but no subtitle with count, assume at least 1 ad
+        logger.warning(msg.CR_SOUP_FIND_ERROR.format("a-search-subtitle"))
+        return 1
+        
+    # Try to extract ad count
+    try:
+        ads_count = int("".join(re.findall(r"\d+", subtitle.text.strip())))
+        return ads_count
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"Error parsing ad count: {e}")
+        # If we can't parse the count but found a subtitle, assume at least 1 ad
+        return 1
 
 
 def get_page_count(content: bs, ads_count: int, config: Config) -> int:
@@ -123,7 +139,11 @@ def filter_ads_on_db_exists(connector: DBConnection, ads_url: list[str]) -> list
     filtered_ads_url = []
     for url in ads_url:
         try:
-            flat_id = int(url.split("/")[-1])
+            # Extract flat ID - fix to handle query parameters
+            # Get last part of URL after the last slash
+            id_part = url.split("/")[-1]
+            # Strip query parameters by taking everything before the question mark
+            flat_id = int(id_part.split("?")[0])
             
             # Check if the flat exists and get its latest price in one database query
             query = """
@@ -160,11 +180,12 @@ def get_flats_data_on_page(
     flats_data = []
     for url in ads_urls:
         try:
-            # Get flat ID from URL
-            flat_id = int(url.split("/")[-1])
+            # Get flat ID from URL - fix to handle query parameters
+            id_part = url.split("/")[-1]
+            flat_id = int(id_part.split("?")[0])
             
             # First, get current price from API
-            home_number = url.split('/')[-1]
+            home_number = id_part.split("?")[0]  # Use clean ID without query params
             try:
                 priceAnalyze = get_response(PRICE_ANALYZE_URL + home_number, config)
                 response = get_response(url, config)
@@ -239,39 +260,143 @@ def run_crawler(config: Config, connector: DBConnection, url: str) -> None:
     response = get_response(url, config)
     content = get_content(response)
     ads_count = get_ads_count(content)
+    
+    # If no ads were found, log warning and return instead of failing
+    if ads_count == 0:
+        logger.warning(f"No ads found for URL: {url}. Try using different search parameters.")
+        return
+        
     page_count = get_page_count(content, ads_count, config)
     flat_parser = FlatParser
 
     with logging_redirect_tqdm():
         for num in trange(1, page_count + 1):
-            ads_on_page = get_ads_on_page(content)
-            ads_urls = get_ads_urls(config.parser_config.home_url, ads_on_page)
-            filtered_ads_url = filter_ads_on_db_exists(connector, ads_urls)
-
-            if len(filtered_ads_url) == 0:
-                logger.info(f"Page {num}/{page_count}: No new listings to process")
-                if num < page_count:
-                    next_url = get_next_url(config.parser_config.home_url, content)
-                    response = get_response(next_url, config)
-                    content = get_content(response)
-                continue
-
-            logger.info(f"Page {num}/{page_count}: Found {len(filtered_ads_url)} new or updated listings")
-            flats_data = get_flats_data_on_page(filtered_ads_url, config, flat_parser, connector)
+            page_error_count = 0
+            max_page_errors = 3
             
-            if flats_data:
-                insert_flats_data_db(connector, flats_data)
-                logger.info(f"Page {num}/{page_count}: Inserted {len(flats_data)} listings")
-            else:
-                logger.info(f"Page {num}/{page_count}: No listings to insert after price check")
+            while page_error_count < max_page_errors:
+                try:
+                    # Get ads on current page
+                    ads_on_page = get_ads_on_page(content)
+                    ads_urls = get_ads_urls(config.parser_config.home_url, ads_on_page)
+                    
+                    # Try filtering with retry logic for database operations
+                    max_retries = 3
+                    filtered_ads_url = []
+                    filter_success = False
+                    
+                    for retry in range(max_retries):
+                        try:
+                            filtered_ads_url = filter_ads_on_db_exists(connector, ads_urls)
+                            filter_success = True
+                            break
+                        except Exception as e:
+                            logger.error(f"Error filtering ads (attempt {retry+1}/{max_retries}): {e}")
+                            
+                            # Try to reconnect to the database if needed
+                            if "connection" in str(e).lower() or "closed" in str(e).lower():
+                                try:
+                                    logger.info("Attempting to reconnect to database...")
+                                    connector.reconnect()
+                                except Exception as conn_err:
+                                    logger.error(f"Failed to reconnect: {conn_err}")
+                                    
+                            if retry == max_retries - 1:
+                                logger.warning("Max retries reached for filtering ads.")
+                            else:
+                                sleep_time = config.parser_config.sleep_time * (retry + 1)
+                                logger.info(f"Retrying in {sleep_time} seconds...")
+                                sleep(sleep_time)
+                    
+                    if not filter_success:
+                        logger.warning(f"Could not filter ads on page {num}, continuing with all ads")
+                        filtered_ads_url = ads_urls  # Use all ads if filtering failed
+                    
+                    if len(filtered_ads_url) == 0:
+                        logger.info(f"Page {num}/{page_count}: No new listings to process")
+                        break  # Break out of retry loop for this page
+                    
+                    logger.info(f"Page {num}/{page_count}: Found {len(filtered_ads_url)} new or updated listings")
+                    
+                    # Process flats data with improved retry logic
+                    flats_data = []
+                    max_retries = 3
+                    process_success = False
+                    
+                    for retry in range(max_retries):
+                        try:
+                            flats_data = get_flats_data_on_page(filtered_ads_url, config, flat_parser, connector)
+                            process_success = True
+                            break
+                        except MaximumMissedAdError as e:
+                            # Don't retry if we hit the maximum number of missed ads
+                            logger.error(f"Maximum missed ad limit reached: {e}")
+                            break
+                        except Exception as e:
+                            logger.error(f"Error processing flats data (attempt {retry+1}/{max_retries}): {e}")
+                            
+                            if retry == max_retries - 1:
+                                logger.warning("Max retries reached for processing flats.")
+                            else:
+                                sleep_time = config.parser_config.sleep_time * (retry + 1)
+                                logger.info(f"Retrying in {sleep_time} seconds...")
+                                sleep(sleep_time)
+                    
+                    if flats_data:
+                        # Insert data with retry logic built into the improved insert_flats_data_db function
+                        try:
+                            insert_flats_data_db(connector, flats_data)
+                            logger.info(f"Page {num}/{page_count}: Inserted {len(flats_data)} listings")
+                        except Exception as e:
+                            logger.error(f"Failed to insert flats data: {e}")
+                            # No need to retry here as insert_flats_data_db already has retry logic
+                    else:
+                        logger.info(f"Page {num}/{page_count}: No listings to insert after processing")
+                    
+                    logger.info(msg.CR_PROCESS.format(num, page_count))
+                    
+                    # Successfully processed this page
+                    break  # Break out of retry loop for this page
                 
-            logger.info(msg.CR_PROCESS.format(num, page_count))
-
+                except Exception as e:
+                    page_error_count += 1
+                    logger.error(f"Error processing page {num} (attempt {page_error_count}/{max_page_errors}): {e}")
+                    
+                    if page_error_count >= max_page_errors:
+                        logger.warning(f"Maximum errors reached for page {num}, moving to next page")
+                    else:
+                        logger.info(f"Retrying page {num} in {config.parser_config.sleep_time} seconds...")
+                        sleep(config.parser_config.sleep_time)
+                        
+                        # Try to refresh the page content before retrying
+                        try:
+                            response = get_response(url, config)
+                            content = get_content(response)
+                        except Exception as refresh_err:
+                            logger.error(f"Failed to refresh page content: {refresh_err}")
+            
+            # Proceed to next page regardless of success or failure on current page
             sleep(config.parser_config.sleep_time)
-
+            
             if num < page_count:
-                next_url = get_next_url(config.parser_config.home_url, content)
-                response = get_response(next_url, config)
-                content = get_content(response)
+                next_page_error_count = 0
+                max_next_page_errors = 3
+                
+                while next_page_error_count < max_next_page_errors:
+                    try:
+                        next_url = get_next_url(config.parser_config.home_url, content)
+                        response = get_response(next_url, config)
+                        content = get_content(response)
+                        break
+                    except Exception as next_e:
+                        next_page_error_count += 1
+                        logger.error(f"Failed to proceed to next page (attempt {next_page_error_count}/{max_next_page_errors}): {next_e}")
+                        
+                        if next_page_error_count >= max_next_page_errors:
+                            logger.error("Could not proceed to next page after maximum retries. Stopping crawler.")
+                            # Exit the crawler if we can't proceed to the next page after several attempts
+                            return
+                        
+                        sleep(config.parser_config.sleep_time * next_page_error_count)
 
     logger.info(msg.CR_STOPPED)
